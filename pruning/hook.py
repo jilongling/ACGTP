@@ -1,0 +1,657 @@
+"""Projector-output hook for external visual-token pruning."""
+
+from __future__ import annotations
+
+import time
+from collections import deque
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+import torch
+
+from .config import PruningHookConfig
+from .signals.robot import TokenGeometryCache
+from .internal.backend import (
+    disable_acgtp_internal_pruning,
+    enable_acgtp_internal_pruning,
+)
+from .runtime.diagnostics import HookDiagnosticsMixin
+from .runtime.fast import HookFastRuntimeMixin
+from .runtime.geometry import HookGeometryMixin
+from .legacy.runtime import HookLegacyRuntimeMixin
+from .core.metrics import HookMetrics
+from .runtime.post import PostPruningStateManager
+from .signals.robot import ACGTPStaticSceneCache
+from .strategy_registry import DYNAMIC_MID_KEEP_STRATEGIES
+from .signals.temporal import GeometryHistoryBuffer
+from .signals.action import MotionEMABuffer
+from .signals.temporal import ACGTPHistoryBuffer
+
+
+class VisualTokenPruningHook(HookFastRuntimeMixin, HookLegacyRuntimeMixin, HookDiagnosticsMixin, HookGeometryMixin):
+    """Prunes only projector output visual tokens before LLM input construction."""
+
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        geometry_recorder: Optional[Any] = None,
+        visualizer: Optional[Any] = None,
+    ) -> None:
+        self.cfg = cfg
+        self.config = PruningHookConfig.from_eval_cfg(cfg)
+        self.geometry_recorder = geometry_recorder
+        self.visualizer = visualizer
+        self._hook_handle = None
+        self._latest_stats: Dict[str, Any] = {}
+        self._latest_preprocess_meta: Optional[Any] = None
+        self._latest_token_grid_shape: Optional[Tuple[int, int]] = None
+        self._cache = TokenGeometryCache()
+        self._prev_gripper_pos: Optional[np.ndarray] = None
+        self._prev_episode_id: Optional[int] = None
+        self._hook_episode_id: Optional[int] = None
+        self._hook_step_counter: int = 0
+        self._geo_debug_frames_saved: int = 0
+        self._dropped_overlay_frames_saved: int = 0
+        self._temporal_history = GeometryHistoryBuffer(maxlen=self.config.temporal_history_length)
+        # P15: ACGTP-v1 motion EMA buffer for smoothed motion corridor
+        self._motion_buffer: Optional[MotionEMABuffer] = None
+        # Step 5: lightweight phase hysteresis state for ACGTP dynamic pruning.
+        self._acgtp_dynamic_state: Dict[str, Any] = {}
+        self._static_scene_cache = ACGTPStaticSceneCache(self.config)
+        self._acgtp_latency_plan_cache: Optional[Dict[str, Any]] = None
+        self._acgtp_history = ACGTPHistoryBuffer(
+            maxlen=self.config.acgtp_history_length,
+            scene_current_weight=self.config.acgtp_history_scene_ema_alpha,
+            depth_current_weight=self.config.acgtp_history_depth_ema_alpha,
+            contact_current_weight=self.config.acgtp_history_contact_ema_alpha,
+            motion_current_weight=self.config.acgtp_history_motion_ema_alpha,
+            action_current_weight=self.config.acgtp_history_action_ema_alpha,
+            depth_change_threshold=self.config.acgtp_history_depth_change_threshold,
+            keep_iou_threshold=self.config.acgtp_history_keep_iou_threshold,
+            motion_stability_threshold=self.config.acgtp_history_motion_stability_threshold,
+        )
+        self._acgtp_attention_history = deque(maxlen=max(1, int(self.config.acgtp_attention_history_length)))
+        self._lm_pre_hook_handle = None
+        self._post_pruning = PostPruningStateManager(
+            config=self.config,
+            update_stats=self._update_latest_position_stats,
+        )
+        self._internal_backend = None
+
+    def set_preprocess_meta(self, meta: Any, token_grid_shape: Optional[Tuple[int, int]]) -> None:
+        self._latest_preprocess_meta = meta
+        self._latest_token_grid_shape = token_grid_shape
+
+    def reset_step(self) -> None:
+        self._latest_stats = {}
+        self._last_selector_exception: Optional[Exception] = None
+        self._last_selector_name: Optional[str] = None
+        self._post_pruning.reset()
+
+    @staticmethod
+    def _parse_acgtp_ablate_branches(raw: Any) -> set:
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set)):
+            pieces = raw
+        else:
+            text = str(raw).strip().lower()
+            if text in ("", "none", "off", "false", "0"):
+                return set()
+            pieces = text.replace(";", ",").replace("|", ",").split(",")
+
+        aliases = {
+            "scene": "scene",
+            "scene_layout": "scene",
+            "layout": "scene",
+            "depth": "depth",
+            "structure": "depth",
+            "depth_structure": "depth",
+            "contact": "contact",
+            "contact_ring": "contact",
+            "motion": "motion",
+            "motion_corridor": "motion",
+            "fill": "fill",
+            "constrained_fill": "fill",
+        }
+        out = set()
+        for item in pieces:
+            key = str(item).strip().lower().replace("-", "_")
+            if key in ("", "none", "off", "false", "0"):
+                continue
+            if key == "all":
+                out.update(("scene", "depth", "contact", "motion", "fill"))
+                continue
+            mapped = aliases.get(key)
+            if mapped is not None:
+                out.add(mapped)
+        return out
+
+    def get_latest_stats(self) -> Dict[str, Any]:
+        stats = dict(self._latest_stats)
+        if self._internal_backend is not None:
+            stats.update(self._internal_info_to_stats(self._internal_backend.stats()))
+        return stats
+
+    def _update_latest_position_stats(self, **updates: Any) -> None:
+        if not isinstance(self._latest_stats, dict):
+            self._latest_stats = {}
+        self._latest_stats.update(updates)
+
+    def _prepare_position_preserve_info(
+        self,
+        *,
+        keep_indices_np: np.ndarray,
+        num_tokens: int,
+        metrics: HookMetrics,
+    ) -> None:
+        self._post_pruning.prepare_position_preserve_info(
+            keep_indices_np=keep_indices_np,
+            num_tokens=num_tokens,
+            metrics=metrics,
+        )
+
+    def _language_model_pre_hook(self, module: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+        return self._post_pruning.language_model_pre_hook(module, args, kwargs)
+
+    def _default_keep_ratio_source(self) -> str:
+        if self.config.strategy == "robot_geo_acgtp_v2" and bool(getattr(self.config, "acgtp_dynamic_enabled", False)):
+            return "acgtp_dynamic_controller"
+        return "dynamic_mid_keep_ratio" if self.config.strategy in DYNAMIC_MID_KEEP_STRATEGIES else "cli_keep_ratio"
+
+    def _compression_backend(self) -> str:
+        backend = str(getattr(self.config, "acgtp_compression_backend", "projector") or "projector").strip().lower()
+        if bool(getattr(self.config, "acgtp_internal_pruning_enabled", False)):
+            backend = "internal"
+        return "internal" if backend == "internal" else "projector"
+
+    def _internal_pruning_requested(self) -> bool:
+        return self._compression_backend() == "internal"
+
+    @staticmethod
+    def _internal_info_to_stats(info: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(info, dict) or not info:
+            return {}
+        return {
+            "compression_backend": "internal",
+            "projector_pruning_applied": False,
+            "internal_pruning_requested": True,
+            "internal_pruning_plan_ready": info.get("plan_ready"),
+            "internal_pruning_applied": info.get("applied"),
+            "internal_pruning_layer": info.get("pruning_layer", info.get("requested_prune_layer")),
+            "internal_pruning_disabled_reason": info.get("disabled_reason"),
+            "internal_original_seq_length": info.get("original_seq_length"),
+            "internal_kept_seq_length": info.get("kept_seq_length"),
+            "internal_pruned_seq_length": info.get("pruned_seq_length"),
+            "internal_original_visual_tokens": info.get("original_visual_tokens", info.get("image_token_length")),
+            "internal_kept_visual_tokens": info.get("kept_visual_tokens"),
+            "internal_pruned_visual_tokens": info.get("pruned_visual_tokens"),
+            "visual_tokens_at_llm_entry": info.get("visual_tokens_at_llm_entry"),
+            "visual_tokens_after_internal_prune": info.get("visual_tokens_after_internal_prune"),
+            "visual_token_count_before_prune": info.get("original_visual_tokens", info.get("image_token_length")),
+            "visual_token_count_after_prune": info.get("kept_visual_tokens"),
+            "multimodal_seq_len": info.get("multimodal_seq_len", info.get("original_seq_length")),
+            "llm_input_seq_len": info.get("llm_input_seq_len", info.get("original_seq_length")),
+            "decoder_first_layer_seq_len": info.get("decoder_first_layer_seq_len"),
+            "attention_mask_shape": info.get("attention_mask_shape"),
+            "position_ids_shape": info.get("position_ids_shape"),
+            "cache_position_shape": info.get("cache_position_shape"),
+            "cache_position_len": info.get("cache_position_len"),
+            "attn_implementation": info.get("attn_implementation"),
+            "output_attentions": info.get("output_attentions"),
+            "output_attentions_effective": info.get("output_attentions_effective"),
+            "try_output_attentions": info.get("try_output_attentions"),
+            "latency_mode": info.get("latency_mode"),
+            "latency_contamination_attention": info.get("latency_contamination_attention"),
+            "latency_contamination_debug": info.get("latency_contamination_debug", info.get("internal_latency_contamination_debug")),
+            "internal_latency_fast_path": info.get("internal_latency_fast_path"),
+            "internal_latency_internal_plan_cache_enabled": info.get("internal_latency_internal_plan_cache_enabled"),
+            "internal_latency_internal_plan_cache_hit": info.get("internal_latency_internal_plan_cache_hit"),
+            "internal_latency_internal_plan_cache_reason": info.get("internal_latency_internal_plan_cache_reason"),
+            "internal_latency_internal_plan_cache_lookup_ms": info.get("internal_latency_internal_plan_cache_lookup_ms"),
+            "internal_latency_seq_tensor_cache_enabled": info.get("internal_latency_seq_tensor_cache_enabled"),
+            "internal_latency_seq_tensor_cache_hit": info.get("internal_latency_seq_tensor_cache_hit"),
+            "internal_latency_seq_tensor_cache_reason": info.get("internal_latency_seq_tensor_cache_reason"),
+            "internal_latency_seq_tensor_cache_lookup_ms": info.get("internal_latency_seq_tensor_cache_lookup_ms"),
+            "internal_latency_seq_tensor_cache_hits": info.get("internal_latency_seq_tensor_cache_hits"),
+            "internal_latency_seq_tensor_cache_misses": info.get("internal_latency_seq_tensor_cache_misses"),
+            "internal_selector_total_ms": info.get("internal_selector_total_ms"),
+            "internal_score_depth_edge_ms": info.get("internal_score_depth_edge_ms"),
+            "internal_score_layout_ms": info.get("internal_score_layout_ms"),
+            "internal_score_contact_ms": info.get("internal_score_contact_ms"),
+            "internal_score_motion_ms": info.get("internal_score_motion_ms"),
+            "internal_quota_alloc_ms": info.get("internal_quota_alloc_ms"),
+            "internal_quota_merge_ms": info.get("internal_quota_merge_ms"),
+            "internal_debug_record_ms": info.get("internal_debug_record_ms"),
+            "internal_apply_prune_ms": info.get("internal_apply_prune_ms", info.get("apply_prune_ms")),
+            "internal_trace_enabled": info.get("internal_trace_enabled"),
+            "internal_total_layers": info.get("internal_total_layers"),
+            "internal_first_short_layer": info.get("internal_first_short_layer"),
+            "internal_full_length_layer_count": info.get("internal_full_length_layer_count"),
+            "internal_shortened_layer_count": info.get("internal_shortened_layer_count"),
+            "internal_post_prune_layer_count": info.get("internal_post_prune_layer_count"),
+            "internal_post_prune_layer_ratio": info.get("internal_post_prune_layer_ratio"),
+            "prefill_seq_len_before_layer": info.get("prefill_seq_len_before_layer"),
+            "prefill_seq_len_after_layer": info.get("prefill_seq_len_after_layer"),
+            "prefill_kv_cache_seq_len_by_layer": info.get("prefill_kv_cache_seq_len_by_layer"),
+            "internal_kv_cache_full_length_layer_count": info.get("internal_kv_cache_full_length_layer_count"),
+            "internal_kv_cache_short_length_layer_count": info.get("internal_kv_cache_short_length_layer_count"),
+            "internal_kv_cache_token_reduction_ratio": info.get("internal_kv_cache_token_reduction_ratio"),
+            "internal_kv_cache_mean_seq_len": info.get("internal_kv_cache_mean_seq_len"),
+            "internal_decode_calls": info.get("decode_calls"),
+            "internal_decode_bookkeeping_ms": info.get("internal_decode_bookkeeping_ms"),
+            "last_decode_bookkeeping_ms": info.get("last_decode_bookkeeping_ms"),
+            "internal_decode_pruning_applied": info.get("internal_decode_pruning_applied"),
+            "internal_decode_pruning_reason": info.get("internal_decode_pruning_reason"),
+            "internal_decode_cache_present": info.get("internal_decode_cache_present"),
+            "internal_decode_uses_pruned_prefill_cache": info.get("internal_decode_uses_pruned_prefill_cache"),
+            "internal_decode_prefill_kv_reduction_ratio": info.get("internal_decode_prefill_kv_reduction_ratio"),
+            "internal_decode_cache_benefit_source": info.get("internal_decode_cache_benefit_source"),
+            "internal_decode_cache_consistent": info.get("decode_cache_consistent"),
+            "internal_decode_cache_consistent_by_layer": info.get("decode_cache_consistent_by_layer"),
+            "decode_cache_scalar_omitted_for_latency": info.get("decode_cache_scalar_omitted_for_latency"),
+            "decode_cache_by_layer_omitted_for_latency": info.get("decode_cache_by_layer_omitted_for_latency"),
+            "decode_cache_seq_len_before_by_layer": info.get("decode_cache_seq_len_before_by_layer"),
+            "decode_cache_seq_len_after_by_layer": info.get("decode_cache_seq_len_after_by_layer"),
+            "decode_effective_kv_tokens_mean": info.get("decode_effective_kv_tokens_mean"),
+            "decode_short_cache_layer_count": info.get("decode_short_cache_layer_count"),
+            "decode_pruned_cache_layer_count": info.get("decode_pruned_cache_layer_count"),
+            "internal_decode_attention_capture_requested": info.get("internal_decode_attention_capture_requested"),
+            "internal_decode_attention_capture_enabled": info.get("internal_decode_attention_capture_enabled"),
+            "internal_decode_attention_capture_disabled_for_latency": info.get(
+                "internal_decode_attention_capture_disabled_for_latency"
+            ),
+            "internal_selection_mode": info.get("internal_selection_mode"),
+            "internal_attention_enabled": info.get("internal_attention_enabled"),
+            "internal_attention_available": info.get("internal_attention_available"),
+            "internal_attention_source": info.get("internal_attention_source"),
+            "internal_attention_confidence": info.get("internal_attention_confidence"),
+            "internal_historical_action_attention_available": info.get("internal_historical_action_attention_available"),
+            "internal_historical_action_attention_source": info.get("internal_historical_action_attention_source"),
+            "internal_geo_attention_iou": info.get("internal_geo_attention_iou"),
+            "internal_high_geometry_low_attention_count": info.get("internal_high_geometry_low_attention_count"),
+            "internal_high_attention_low_geometry_count": info.get("internal_high_attention_low_geometry_count"),
+            "internal_attention_dropped_geo_count": info.get("internal_attention_dropped_geo_count"),
+            "internal_pruned_geo_critical_count": info.get("internal_pruned_geo_critical_count"),
+            "internal_geo_protected_count": info.get("internal_geo_protected_count"),
+            "internal_geo_explicit_protected_count": info.get("internal_geo_explicit_protected_count"),
+            "internal_geo_explicit_protected_kept_count": info.get("internal_geo_explicit_protected_kept_count"),
+            "internal_budget_raised_for_geo_protection": info.get("internal_budget_raised_for_geo_protection"),
+            "internal_dynamic_risk": info.get("internal_dynamic_risk"),
+            "internal_dynamic_risk_level": info.get("internal_dynamic_risk_level"),
+            "internal_dynamic_keep_ratio": info.get("internal_dynamic_keep_ratio"),
+            "internal_dynamic_keep_k": info.get("internal_dynamic_keep_k"),
+            "internal_quota_hard_k": info.get("internal_quota_hard_k"),
+            "internal_quota_semantic_attention_k": info.get("internal_quota_semantic_attention_k"),
+            "internal_quota_historical_attention_k": info.get("internal_quota_historical_attention_k"),
+            "internal_functional_quota_enabled": info.get("internal_functional_quota_enabled"),
+            "internal_quota_layout_k": info.get("internal_quota_layout_k"),
+            "internal_quota_contact_k": info.get("internal_quota_contact_k"),
+            "internal_quota_motion_k": info.get("internal_quota_motion_k"),
+            "internal_quota_fill_k": info.get("internal_quota_fill_k"),
+            "internal_selected_by_geo_count": info.get("internal_selected_by_geo_count"),
+            "internal_selected_by_layout_count": info.get("internal_selected_by_layout_count"),
+            "internal_selected_by_contact_count": info.get("internal_selected_by_contact_count"),
+            "internal_selected_by_motion_count": info.get("internal_selected_by_motion_count"),
+            "internal_selected_by_semantic_attention_count": info.get("internal_selected_by_semantic_attention_count"),
+            "internal_selected_by_historical_attention_count": info.get("internal_selected_by_historical_attention_count"),
+            "internal_selected_by_fill_count": info.get("internal_selected_by_fill_count"),
+            "internal_selected_by_fallback_count": info.get("internal_selected_by_fallback_count"),
+            "internal_unique_geo_count": info.get("internal_unique_geo_count"),
+            "internal_unique_layout_count": info.get("internal_unique_layout_count"),
+            "internal_unique_contact_count": info.get("internal_unique_contact_count"),
+            "internal_unique_motion_count": info.get("internal_unique_motion_count"),
+            "internal_unique_semantic_attention_count": info.get("internal_unique_semantic_attention_count"),
+            "internal_unique_historical_attention_count": info.get("internal_unique_historical_attention_count"),
+            "internal_unique_fill_count": info.get("internal_unique_fill_count"),
+            "internal_unique_fallback_count": info.get("internal_unique_fallback_count"),
+            "internal_branch_selected_sum": info.get("internal_branch_selected_sum"),
+            "internal_branch_unique_sum": info.get("internal_branch_unique_sum"),
+            "internal_branch_overlap_count": info.get("internal_branch_overlap_count"),
+            "internal_branch_overlap_ratio": info.get("internal_branch_overlap_ratio"),
+            "internal_branch_unique_ratio": info.get("internal_branch_unique_ratio"),
+            "internal_branch_sum_equals_kept": info.get("internal_branch_sum_equals_kept"),
+            "internal_branch_accounting_valid": info.get("internal_branch_accounting_valid"),
+            "internal_fallback_added_count": info.get("internal_fallback_added_count"),
+            "internal_attention_requires_geometry_alignment": info.get("internal_attention_requires_geometry_alignment"),
+        }
+
+    def _prepare_internal_pruning_plan(
+        self,
+        *,
+        keep_indices_np: np.ndarray,
+        num_tokens: int,
+        metrics: HookMetrics,
+        selection_meta: Dict[str, Any],
+        geometry_payload: Optional[Dict[str, Any]] = None,
+        target_keep_ratio: Optional[float] = None,
+        quota_config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._post_pruning.prepare_internal_pruning_plan(
+            backend=self._internal_backend,
+            keep_indices_np=keep_indices_np,
+            num_tokens=int(num_tokens),
+            metrics=metrics,
+            selection_meta=selection_meta,
+            source=str(selection_meta.get("selector_name") or selection_meta.get("selection_strategy_name") or self.config.strategy),
+            geometry_payload=geometry_payload,
+            target_keep_ratio=target_keep_ratio,
+            quota_config=quota_config,
+        )
+
+    def _runtime_mode(self) -> str:
+        mode = str(getattr(self.config, "acgtp_runtime_mode", "fast") or "fast").strip().lower()
+        return mode if mode in {"fast", "debug", "audit"} else "fast"
+
+    def _is_fast_runtime(self) -> bool:
+        return self._runtime_mode() == "fast"
+
+    def _is_audit_runtime(self) -> bool:
+        return self._runtime_mode() == "audit" or bool(getattr(self.config, "acgtp_full_diagnostics_enabled", False))
+
+    def _latency_plan_cache_enabled(self) -> bool:
+        return (
+            self._is_fast_runtime()
+            and not self._is_audit_runtime()
+            and bool(getattr(self.config, "acgtp_latency_plan_cache_enabled", False))
+        )
+
+    @staticmethod
+    def _clone_latency_cache_value(value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        if isinstance(value, dict):
+            return {k: VisualTokenPruningHook._clone_latency_cache_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [VisualTokenPruningHook._clone_latency_cache_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(VisualTokenPruningHook._clone_latency_cache_value(v) for v in value)
+        return value
+
+    @staticmethod
+    def _clone_latency_cache_meta(value: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Keep latency cache metadata scalar-only to avoid per-step payload copies."""
+
+        if not isinstance(value, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(item, np.generic):
+                out[key] = item.item()
+            elif isinstance(item, (str, int, float, bool, type(None))):
+                out[key] = item
+        return out
+
+    def _reset_latency_plan_cache(self) -> None:
+        self._acgtp_latency_plan_cache = None
+
+    def _latency_depth_probe(self, depth: np.ndarray) -> np.ndarray:
+        arr = np.asarray(depth, dtype=np.float32)
+        if arr.ndim == 3:
+            arr = arr[:, :, 0]
+        if arr.size == 0:
+            return np.zeros((0,), dtype=np.float32)
+        stride_y = max(1, int(arr.shape[0]) // 16)
+        stride_x = max(1, int(arr.shape[1]) // 16)
+        probe = arr[::stride_y, ::stride_x][:16, :16]
+        return np.nan_to_num(probe, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=True)
+
+    def _lookup_latency_plan_cache(
+        self,
+        *,
+        depth_probe: Optional[np.ndarray],
+        grip: np.ndarray,
+        num_tokens: int,
+        keep_count: int,
+        token_grid_shape: Tuple[int, int],
+        cache_context_key: Optional[Tuple[Any, ...]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        start = time.perf_counter()
+        enabled = self._latency_plan_cache_enabled()
+        meta: Dict[str, Any] = {
+            "acgtp_latency_plan_cache_enabled": enabled,
+            "acgtp_latency_plan_cache_hit": False,
+            "acgtp_latency_plan_cache_reason": "disabled" if not enabled else None,
+            "acgtp_latency_plan_cache_age": None,
+            "acgtp_latency_plan_cache_depth_delta": None,
+            "acgtp_latency_plan_cache_gripper_delta": None,
+            "acgtp_latency_plan_cache_lookup_ms": None,
+            "acgtp_latency_plan_cache_keep_count": None,
+            "acgtp_latency_plan_cache_context_key": cache_context_key,
+            "acgtp_latency_plan_cache_cached_context_key": None,
+        }
+        if not enabled:
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+
+        cached = self._acgtp_latency_plan_cache
+        if not cached:
+            meta["acgtp_latency_plan_cache_reason"] = "empty"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+
+        age = max(0, int(self._hook_step_counter) - int(cached.get("step_counter", 0)))
+        meta["acgtp_latency_plan_cache_age"] = age
+        max_age = int(getattr(self.config, "acgtp_latency_plan_cache_max_age", 4))
+        if max_age <= 0 or age <= 0 or age > max_age:
+            meta["acgtp_latency_plan_cache_reason"] = "age"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+        if int(cached.get("num_tokens", -1)) != int(num_tokens) or int(cached.get("keep_count", -1)) != int(keep_count):
+            meta["acgtp_latency_plan_cache_reason"] = "shape_or_keep"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+        if tuple(cached.get("token_grid_shape", ())) != tuple(token_grid_shape):
+            meta["acgtp_latency_plan_cache_reason"] = "grid"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+        cached_context_key = cached.get("cache_context_key")
+        meta["acgtp_latency_plan_cache_cached_context_key"] = cached_context_key
+        if cache_context_key != cached_context_key:
+            meta["acgtp_latency_plan_cache_reason"] = "context_key"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+
+        cached_probe = cached.get("depth_probe")
+        if depth_probe is None or cached_probe is None or np.asarray(depth_probe).shape != np.asarray(cached_probe).shape:
+            meta["acgtp_latency_plan_cache_reason"] = "depth_probe"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+        depth_delta = float(np.mean(np.abs(np.asarray(depth_probe, dtype=np.float32) - np.asarray(cached_probe, dtype=np.float32))))
+        meta["acgtp_latency_plan_cache_depth_delta"] = depth_delta
+        if depth_delta > float(getattr(self.config, "acgtp_latency_plan_cache_depth_delta_threshold", 0.030)):
+            meta["acgtp_latency_plan_cache_reason"] = "depth_delta"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+
+        cached_grip = cached.get("gripper_pos")
+        if cached_grip is None:
+            meta["acgtp_latency_plan_cache_reason"] = "gripper_missing"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+        grip_delta = float(np.linalg.norm(np.asarray(grip, dtype=np.float32).reshape(3) - np.asarray(cached_grip, dtype=np.float32).reshape(3)))
+        meta["acgtp_latency_plan_cache_gripper_delta"] = grip_delta
+        if grip_delta > float(getattr(self.config, "acgtp_latency_plan_cache_gripper_delta_threshold", 0.080)):
+            meta["acgtp_latency_plan_cache_reason"] = "gripper_delta"
+            meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, meta
+
+        meta["acgtp_latency_plan_cache_hit"] = True
+        meta["acgtp_latency_plan_cache_reason"] = "hit"
+        meta["acgtp_latency_plan_cache_keep_count"] = int(cached.get("keep_indices", np.empty(0)).size)
+        meta["acgtp_latency_plan_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+        return cached, meta
+
+    def _store_latency_plan_cache(
+        self,
+        *,
+        depth_probe: Optional[np.ndarray],
+        grip: np.ndarray,
+        num_tokens: int,
+        keep_count: int,
+        token_grid_shape: Tuple[int, int],
+        keep_indices_np: np.ndarray,
+        selection_meta: Dict[str, Any],
+        geometry_payload: Optional[Dict[str, Any]],
+        robot_metrics: Dict[str, Any],
+        valid_ratio: Optional[float],
+        depth_source_key: Optional[Any],
+        cache_context_key: Optional[Tuple[Any, ...]] = None,
+    ) -> None:
+        if not self._latency_plan_cache_enabled() or depth_probe is None:
+            self._reset_latency_plan_cache()
+            return
+        self._acgtp_latency_plan_cache = {
+            "step_counter": int(self._hook_step_counter),
+            "depth_probe": np.asarray(depth_probe, dtype=np.float32).copy(),
+            "gripper_pos": np.asarray(grip, dtype=np.float32).reshape(3).copy(),
+            "num_tokens": int(num_tokens),
+            "keep_count": int(keep_count),
+            "token_grid_shape": tuple(token_grid_shape),
+            "keep_indices": np.asarray(keep_indices_np, dtype=np.int64).reshape(-1).copy(),
+            "selection_meta": self._clone_latency_cache_meta(selection_meta),
+            "geometry_payload": geometry_payload,
+            "robot_metrics": dict(robot_metrics or {}),
+            "valid_ratio": valid_ratio,
+            "depth_source_key": depth_source_key,
+            "cache_context_key": cache_context_key,
+        }
+
+    def attach_to_model(self, model: Any) -> bool:
+        projector_attached = False
+        for name, module in model.named_modules():
+            if name == "projector":
+                self._hook_handle = module.register_forward_hook(self._projector_hook)
+                projector_attached = True
+                break
+
+        language_model = getattr(model, "language_model", None)
+        if self._internal_pruning_requested():
+            try:
+                self._internal_backend = enable_acgtp_internal_pruning(
+                    model,
+                    prune_layer=int(getattr(self.config, "acgtp_internal_prune_layer", 2)),
+                    image_token_start_index=1,
+                    image_token_length=256,
+                    fail_on_error=bool(getattr(self.config, "acgtp_internal_fail_on_backend_error", True)),
+                )
+            except Exception as exc:
+                self._internal_backend = None
+                self._update_latest_position_stats(
+                    compression_backend="internal",
+                    internal_pruning_requested=True,
+                    internal_backend_error=f"{type(exc).__name__}: {exc}",
+                    internal_pruning_plan_ready=False,
+                    internal_pruning_applied=False,
+                )
+                if bool(getattr(self.config, "acgtp_internal_fail_on_backend_error", True)):
+                    raise
+            if self._internal_backend is None:
+                self._update_latest_position_stats(
+                    compression_backend="internal",
+                    internal_pruning_requested=True,
+                    internal_backend_error="backend_attach_failed",
+                    internal_pruning_plan_ready=False,
+                    internal_pruning_applied=False,
+                )
+                if bool(getattr(self.config, "acgtp_internal_fail_on_backend_error", True)):
+                    raise RuntimeError("ACGTP internal pruning backend could not attach to language_model.model")
+                if not bool(getattr(self.config, "acgtp_internal_allow_projector_fallback", False)):
+                    return False
+                self.config.acgtp_compression_backend = "projector"
+                self.config.acgtp_internal_pruning_enabled = False
+        if language_model is not None and not self._internal_pruning_requested():
+            try:
+                self._lm_pre_hook_handle = language_model.register_forward_pre_hook(
+                    self._language_model_pre_hook,
+                    with_kwargs=True,
+                )
+            except TypeError:
+                self._lm_pre_hook_handle = None
+                self._update_latest_position_stats(
+                    position_preserve_enabled=bool(getattr(self.config, "acgtp_position_preserve_enabled", True)),
+                    position_preserve_applied=False,
+                    position_preserve_reason="forward_pre_hook_with_kwargs_unavailable",
+                )
+        return projector_attached
+
+    def detach(self) -> None:
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+            self._hook_handle = None
+        if self._lm_pre_hook_handle is not None:
+            self._lm_pre_hook_handle.remove()
+            self._lm_pre_hook_handle = None
+        if self._internal_backend is not None:
+            disable_acgtp_internal_pruning(getattr(self._internal_backend, "model", None))
+            self._internal_backend = None
+
+    def _projector_hook(self, module: Any, inputs: Tuple[torch.Tensor], output: torch.Tensor) -> torch.Tensor:
+        start_total = time.perf_counter()
+
+        with torch.no_grad():
+            pruned, metrics = self._run(output)
+        metrics.timing.hook_total_ms = (time.perf_counter() - start_total) * 1000.0
+        if self._acgtp_fast_runtime_enabled() and hasattr(metrics, "to_fast_eval_stats"):
+            self._latest_stats = metrics.to_fast_eval_stats()
+        else:
+            self._latest_stats = metrics.to_eval_stats()
+        self._latest_stats["acgtp_runtime_mode"] = self._runtime_mode()
+        return pruned
+
+    def _mark_warmup_step(self, latest: Any) -> bool:
+        episode_id = getattr(latest, "episode_id", None) if latest is not None else None
+        if episode_id is not None and int(episode_id) != self._hook_episode_id:
+            self._hook_episode_id = int(episode_id)
+            self._hook_step_counter = 0
+            self._temporal_history.reset()
+            self._motion_buffer = None  # P15: reset ACGTP-v1 motion EMA on episode boundary
+            self._acgtp_dynamic_state = {}  # Step 5: reset phase hysteresis per episode
+            self._static_scene_cache.reset()
+            self._reset_latency_plan_cache()
+            self._acgtp_history.reset()  # Step 6: reset history stabilizer per episode
+            self._acgtp_attention_history.clear()
+        is_warmup = self._hook_step_counter == 0
+        self._hook_step_counter += 1
+        return bool(is_warmup)
+
+    def _contact_budget_counts(self, keep_count: int) -> Tuple[int, int, int]:
+        k_total = int(keep_count)
+        edge_ratio = max(0.0, float(self.config.contact_budget_edge_ratio))
+        geo_ratio = max(0.0, float(self.config.contact_budget_geo_ratio))
+        diverse_ratio = max(0.0, float(self.config.contact_budget_diverse_ratio))
+        ratio_sum = edge_ratio + geo_ratio + diverse_ratio
+        if ratio_sum > 1e-8:
+            edge_ratio /= ratio_sum
+            geo_ratio /= ratio_sum
+        k_edge = int(round(k_total * edge_ratio))
+        k_geo = int(round(k_total * geo_ratio))
+        k_edge = max(0, min(k_edge, k_total))
+        k_geo = max(0, min(k_geo, k_total - k_edge))
+        k_diverse = k_total - k_edge - k_geo
+        return k_edge, k_geo, k_diverse
+
+    def _update_temporal_history_after_selection(
+        self,
+        *,
+        keep_indices_np: np.ndarray,
+        num_tokens: int,
+        scores: Optional[np.ndarray],
+        robot_metrics: Dict[str, Any],
+        dynamic_keep_ratio: Optional[float],
+    ) -> None:
+        keep_mask = np.zeros(int(num_tokens), dtype=np.bool_)
+        idx = np.asarray(keep_indices_np, dtype=np.int64)
+        idx = idx[(idx >= 0) & (idx < int(num_tokens))]
+        keep_mask[idx] = True
+        latest = self.geometry_recorder.get_latest() if self.geometry_recorder is not None else None
+        self._temporal_history.update(
+            robot_state={"gripper_pos": robot_metrics.get("gripper_pos")},
+            motion_direction=robot_metrics.get("motion_direction"),
+            final_scores=scores,
+            keep_mask=keep_mask,
+            contact_risk_score=robot_metrics.get("rule_v0_contact_risk_scores"),
+            valid_3d_ratio=robot_metrics.get("valid_token_ratio"),
+            dynamic_keep_ratio=dynamic_keep_ratio,
+            step_index=getattr(latest, "step_id", None) if latest is not None else None,
+        )

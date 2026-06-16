@@ -1,0 +1,1857 @@
+"""LLM-internal ACGTP pruning backend."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, field
+import time
+import types
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+
+import torch
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.modeling_outputs import BaseModelOutputWithPast
+
+from ..methods.functional_quota import select_internal_quota_tokens
+
+
+@dataclass(frozen=True)
+class InternalPruningPlan:
+    """A pending ACGTP plan expressed in visual-token coordinates.
+
+    ``visual_keep_indices`` is the legacy/fallback decision made by the
+    projector hook. When ``geometry_payload`` is present, the internal backend
+    can replace that fallback with a geometry-guarded attention-aware decision
+    after shallow LLM fusion.
+    """
+
+    visual_keep_indices: Tuple[int, ...]
+    original_visual_tokens: int = 256
+    prune_layer: int = 2
+    image_token_start_index: int = 1
+    source: str = "acgtp"
+    selector_metadata: Dict[str, Any] = field(default_factory=dict)
+    geometry_payload: Dict[str, Any] = field(default_factory=dict)
+    target_keep_ratio: Optional[float] = None
+    quota_config: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_visual_keep_indices(
+        cls,
+        visual_keep_indices: Any,
+        *,
+        original_visual_tokens: int = 256,
+        prune_layer: int = 2,
+        image_token_start_index: int = 1,
+        source: str = "acgtp",
+        selector_metadata: Optional[Dict[str, Any]] = None,
+        geometry_payload: Optional[Dict[str, Any]] = None,
+        target_keep_ratio: Optional[float] = None,
+        quota_config: Optional[Dict[str, Any]] = None,
+    ) -> "InternalPruningPlan":
+        idx = _sanitize_visual_indices(visual_keep_indices, int(original_visual_tokens), device=None)
+        ratio = target_keep_ratio
+        if ratio is not None:
+            try:
+                ratio = max(0.0, min(1.0, float(ratio)))
+            except Exception:
+                ratio = None
+        return cls(
+            visual_keep_indices=tuple(int(x) for x in idx.cpu().tolist()),
+            original_visual_tokens=int(original_visual_tokens),
+            prune_layer=int(prune_layer),
+            image_token_start_index=int(image_token_start_index),
+            source=str(source),
+            selector_metadata=dict(selector_metadata or {}),
+            geometry_payload=dict(geometry_payload or {}),
+            target_keep_ratio=ratio,
+            quota_config=dict(quota_config or {}),
+        )
+
+    @property
+    def kept_visual_tokens(self) -> int:
+        return len(self.visual_keep_indices)
+
+    @property
+    def pruned_visual_tokens(self) -> int:
+        return max(0, int(self.original_visual_tokens) - self.kept_visual_tokens)
+
+    def seq_keep_indices_from_visual(
+        self,
+        visual_keep_indices: Any,
+        *,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.LongTensor:
+        """Map relative visual keep indices to full multimodal sequence indices."""
+
+        seq_len = int(seq_len)
+        image_start = max(0, int(self.image_token_start_index))
+        image_end = min(seq_len, image_start + int(self.original_visual_tokens))
+        if image_start >= image_end:
+            return torch.arange(seq_len, dtype=torch.long, device=device)
+
+        visual_len = image_end - image_start
+        visual = _sanitize_visual_indices(visual_keep_indices, visual_len, device=device)
+        if int(visual.numel()) > 0:
+            visual = visual + image_start
+        prefix = torch.arange(0, image_start, dtype=torch.long, device=device)
+        suffix = torch.arange(image_end, seq_len, dtype=torch.long, device=device)
+        keep = torch.cat((prefix, visual, suffix), dim=0)
+        if int(keep.numel()) == 0:
+            return torch.arange(seq_len, dtype=torch.long, device=device)
+        return torch.unique(keep, sorted=True)
+
+    def seq_keep_indices(self, *, seq_len: int, device: torch.device) -> torch.LongTensor:
+        return self.seq_keep_indices_from_visual(self.visual_keep_indices, seq_len=seq_len, device=device)
+
+
+def _sanitize_visual_indices(indices: Any, n: int, *, device: Optional[torch.device]) -> torch.LongTensor:
+    if indices is None:
+        return torch.empty(0, dtype=torch.long, device=device)
+    idx = torch.as_tensor(indices, dtype=torch.long, device=device).reshape(-1)
+    if int(idx.numel()) > 0:
+        valid = (idx >= 0) & (idx < int(n))
+        idx = torch.unique(idx[valid], sorted=True)
+    return idx
+
+
+def _cache_seq_length(cache: Any) -> Optional[int]:
+    if cache is None:
+        return None
+    if hasattr(cache, "get_seq_length"):
+        try:
+            return int(cache.get_seq_length())
+        except Exception:
+            pass
+    if isinstance(cache, (tuple, list)) and cache:
+        first = cache[0]
+        if isinstance(first, (tuple, list)) and first:
+            key = first[0]
+            if hasattr(key, "shape") and len(key.shape) >= 3:
+                return int(key.shape[-2])
+    return None
+
+
+def _cache_layer_seq_lengths(cache: Any) -> Optional[List[int]]:
+    """Return per-layer KV cache sequence lengths when the cache layout exposes them."""
+
+    if cache is None:
+        return None
+    if hasattr(cache, "to_legacy_cache"):
+        try:
+            cache = cache.to_legacy_cache()
+        except Exception:
+            pass
+    if hasattr(cache, "key_cache"):
+        try:
+            lengths = []
+            for key in getattr(cache, "key_cache"):
+                if hasattr(key, "shape") and len(key.shape) >= 3:
+                    lengths.append(int(key.shape[-2]))
+            return lengths or None
+        except Exception:
+            pass
+    if isinstance(cache, (tuple, list)):
+        lengths = []
+        for layer in cache:
+            key = None
+            if isinstance(layer, (tuple, list)) and layer:
+                key = layer[0]
+            elif hasattr(layer, "shape"):
+                key = layer
+            if hasattr(key, "shape") and len(key.shape) >= 3:
+                lengths.append(int(key.shape[-2]))
+        return lengths or None
+    return None
+
+
+def _mean_int(values: Optional[Sequence[int]]) -> Optional[float]:
+    if not values:
+        return None
+    return float(sum(int(v) for v in values)) / float(len(values))
+
+
+def _count_equal(values: Optional[Sequence[int]], target: Optional[int]) -> Optional[int]:
+    if not values or target is None:
+        return None
+    return int(sum(1 for v in values if int(v) == int(target)))
+
+
+def _count_less_than(values: Optional[Sequence[int]], target: Optional[int]) -> Optional[int]:
+    if not values or target is None:
+        return None
+    return int(sum(1 for v in values if int(v) < int(target)))
+
+
+def _shape_repr(value: Any) -> Optional[str]:
+    if value is None or not hasattr(value, "shape"):
+        return None
+    try:
+        return str([int(x) for x in value.shape])
+    except Exception:
+        return None
+
+
+def _numel_or_none(value: Any) -> Optional[int]:
+    if value is None or not hasattr(value, "numel"):
+        return None
+    try:
+        return int(value.numel())
+    except Exception:
+        return None
+
+
+def _attn_implementation_name(config: Any) -> Optional[str]:
+    if config is None:
+        return None
+    value = (
+        getattr(config, "_attn_implementation", None)
+        or getattr(config, "attn_implementation", None)
+        or getattr(config, "attention_implementation", None)
+    )
+    return str(value) if value is not None else None
+
+
+def _as_return_cache(output: Any) -> Any:
+    if hasattr(output, "past_key_values"):
+        return output.past_key_values
+    if isinstance(output, (tuple, list)) and len(output) > 1:
+        return output[1]
+    return None
+
+
+def _extract_output_attentions(output: Any) -> Optional[Sequence[Any]]:
+    attn = getattr(output, "attentions", None)
+    if attn is not None:
+        return attn
+    if isinstance(output, (tuple, list)):
+        for item in reversed(output):
+            if isinstance(item, (tuple, list)) and item:
+                first = item[0]
+                if torch.is_tensor(first) and first.ndim >= 4:
+                    return item
+    return None
+
+
+def _update_causal_mask(model: Any, attention_mask: Any, hidden_states: torch.Tensor, cache_position: torch.Tensor, past_seen_tokens: int):
+    """Call the installed Transformers causal-mask helper across API versions."""
+
+    fn = model._update_causal_mask
+    call_variants = (
+        (attention_mask, hidden_states, cache_position, past_seen_tokens),
+        (attention_mask, hidden_states, past_seen_tokens),
+        (attention_mask, hidden_states, cache_position),
+        (attention_mask, hidden_states),
+    )
+    last_error = None
+    for args in call_variants:
+        try:
+            return fn(*args)
+        except TypeError as exc:
+            last_error = exc
+    raise last_error
+
+
+def _payload_tensor(plan: InternalPruningPlan, key: str, n: int, device: torch.device, *, default: float = 0.0) -> torch.Tensor:
+    value = plan.geometry_payload.get(key)
+    if value is None:
+        return torch.full((n,), float(default), dtype=torch.float32, device=device)
+    try:
+        out = torch.as_tensor(value, dtype=torch.float32, device=device).reshape(-1)
+        if int(out.numel()) != int(n):
+            return torch.full((n,), float(default), dtype=torch.float32, device=device)
+        return torch.nan_to_num(out, nan=float(default), posinf=float(default), neginf=float(default))
+    except Exception:
+        return torch.full((n,), float(default), dtype=torch.float32, device=device)
+
+
+def _payload_mask(plan: InternalPruningPlan, key: str, n: int, device: torch.device, *, default: bool = True) -> torch.Tensor:
+    value = plan.geometry_payload.get(key)
+    if value is None:
+        return torch.full((n,), bool(default), dtype=torch.bool, device=device)
+    try:
+        out = torch.as_tensor(value, device=device).reshape(-1)
+        if int(out.numel()) != int(n):
+            return torch.full((n,), bool(default), dtype=torch.bool, device=device)
+        return out.bool()
+    except Exception:
+        return torch.full((n,), bool(default), dtype=torch.bool, device=device)
+
+
+def _norm01(score: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    score = torch.nan_to_num(score.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    finite = valid.bool() & torch.isfinite(score)
+    out = torch.zeros_like(score, dtype=torch.float32)
+    if int(finite.sum().item()) <= 0:
+        return out
+    vals = score[finite]
+    lo = torch.min(vals)
+    hi = torch.max(vals)
+    if float((hi - lo).detach().cpu()) > 1e-8:
+        out[finite] = (score[finite] - lo) / (hi - lo)
+    else:
+        out[finite] = torch.clamp(score[finite], 0.0, 1.0)
+    out[~valid.bool()] = 0.0
+    return torch.clamp(out, 0.0, 1.0)
+
+
+def _topk(score: torch.Tensor, k: int, eligible: torch.Tensor) -> torch.LongTensor:
+    k = int(k)
+    if k <= 0:
+        return torch.empty(0, dtype=torch.long, device=score.device)
+    mask = eligible.bool() & torch.isfinite(score) & (score > 0.0)
+    cand = torch.nonzero(mask, as_tuple=False).reshape(-1)
+    if int(cand.numel()) == 0:
+        return torch.empty(0, dtype=torch.long, device=score.device)
+    if int(cand.numel()) > k:
+        vals = score.index_select(0, cand)
+        top_pos = torch.topk(vals, k=k, largest=True, sorted=False).indices
+        cand = cand.index_select(0, top_pos)
+    vals = score.index_select(0, cand)
+    order = torch.argsort(vals, descending=True)
+    return cand.index_select(0, order).long()
+
+
+def _mask_from_indices(indices: torch.Tensor, n: int, device: torch.device) -> torch.Tensor:
+    mask = torch.zeros(n, dtype=torch.bool, device=device)
+    if indices is not None and int(indices.numel()) > 0:
+        mask[indices.long()] = True
+    return mask
+
+
+def _iou(a: torch.Tensor, b: torch.Tensor) -> float:
+    a = a.bool()
+    b = b.bool()
+    union = torch.sum(a | b).item()
+    if union <= 0:
+        return 1.0
+    return float(torch.sum(a & b).item()) / float(union)
+
+
+def _text_to_visual_attention(
+    attn_weights: Optional[torch.Tensor],
+    *,
+    image_start: int,
+    image_len: int,
+    seq_len: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, bool, float]:
+    score = torch.zeros(image_len, dtype=torch.float32, device=device)
+    if attn_weights is None or not torch.is_tensor(attn_weights) or attn_weights.ndim < 4:
+        if torch.is_tensor(attn_weights) and attn_weights.ndim == 1:
+            flat = attn_weights.detach().to(dtype=torch.float32, device=device).reshape(-1)
+            out_len = min(int(image_len), int(flat.numel()))
+            if out_len > 0:
+                score[:out_len] = flat[:out_len]
+                score = _norm01(score, torch.ones_like(score, dtype=torch.bool))
+                conf = float(torch.mean(score[score > 0]).detach().cpu()) if bool(torch.any(score > 0)) else 0.0
+                return score, bool(torch.any(score > 0).item()), conf
+        return score, False, 0.0
+    try:
+        attn = attn_weights.detach().to(dtype=torch.float32)
+        q_len = int(attn.shape[-2])
+        k_len = int(attn.shape[-1])
+        image_end = min(k_len, int(image_start) + int(image_len))
+        if image_end <= int(image_start):
+            return score, False, 0.0
+        text_q_start = min(q_len, min(int(seq_len), int(image_start) + int(image_len)))
+        if text_q_start < q_len:
+            block = attn[..., text_q_start:q_len, int(image_start):image_end]
+        else:
+            block = attn[..., max(0, q_len - 1):q_len, int(image_start):image_end]
+        if int(block.numel()) <= 0:
+            return score, False, 0.0
+        reduced = torch.mean(block, dim=tuple(range(block.ndim - 1)))
+        out_len = min(image_len, int(reduced.numel()))
+        score[:out_len] = reduced.reshape(-1)[:out_len]
+        score = _norm01(score, torch.ones_like(score, dtype=torch.bool))
+        conf = float(torch.mean(score[score > 0]).detach().cpu()) if bool(torch.any(score > 0)) else 0.0
+        return score, bool(torch.any(score > 0).item()), conf
+    except Exception:
+        return score, False, 0.0
+
+
+def _qk_text_to_visual_attention(
+    decoder_layer: Any,
+    hidden_states: torch.Tensor,
+    *,
+    image_start: int,
+    image_len: int,
+) -> Optional[torch.Tensor]:
+    """Compute a lightweight LLM-internal text-to-vision Q/K relevance vector.
+
+    FlashAttention often does not materialize attention probabilities. This
+    fallback still uses the real LLM layer projections and current hidden states
+    instead of hook-side proxy scores.
+    """
+
+    try:
+        attn = getattr(decoder_layer, "self_attn", None)
+        q_proj = getattr(attn, "q_proj", None)
+        k_proj = getattr(attn, "k_proj", None)
+        if q_proj is None or k_proj is None:
+            return None
+        if hidden_states is None or not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
+            return None
+        bsz, seq_len, _ = hidden_states.shape
+        if int(bsz) != 1:
+            return None
+        image_end = min(int(seq_len), int(image_start) + int(image_len))
+        text_start = image_end
+        if image_end <= int(image_start) or text_start >= int(seq_len):
+            return None
+        q = q_proj(hidden_states[:, text_start:, :]).detach().to(dtype=torch.float32)
+        k = k_proj(hidden_states[:, int(image_start):image_end, :]).detach().to(dtype=torch.float32)
+        q = q.reshape(-1, q.shape[-1])
+        k = k.reshape(-1, k.shape[-1])
+        if int(q.numel()) <= 0 or int(k.numel()) <= 0:
+            return None
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+        logits = torch.matmul(q, k.transpose(0, 1))
+        score = torch.softmax(logits, dim=-1).mean(dim=0)
+        out = torch.zeros(int(image_len), dtype=torch.float32, device=hidden_states.device)
+        out[: int(score.numel())] = score[: int(image_len)]
+        return _norm01(out, torch.ones_like(out, dtype=torch.bool))
+    except Exception:
+        return None
+
+
+class ACGTPInternalPruningBackend:
+    """Runtime owner for the patched LlamaModel forward path."""
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        prune_layer: int = 2,
+        image_token_start_index: int = 1,
+        image_token_length: int = 256,
+        fail_on_error: bool = True,
+    ) -> None:
+        self.model = model
+        self.language_model = getattr(model, "language_model", None)
+        self.backbone = getattr(self.language_model, "model", None) if self.language_model is not None else None
+        self.prune_layer = int(prune_layer)
+        self.image_token_start_index = int(image_token_start_index)
+        self.image_token_length = int(image_token_length)
+        self.fail_on_error = bool(fail_on_error)
+        self.pending_plan: Optional[InternalPruningPlan] = None
+        self.last_info: Dict[str, Any] = {}
+        self.decode_calls: int = 0
+        self.prefill_attention_history: Deque[Tuple[float, ...]] = deque(maxlen=3)
+        self.action_attention_history: Deque[Tuple[float, ...]] = deque(maxlen=3)
+        self._current_visual_keep_indices: Tuple[int, ...] = tuple()
+        self._current_visual_keep_tensor: Optional[torch.Tensor] = None
+        self._current_original_visual_tokens: int = int(image_token_length)
+        self._current_image_token_start_index: int = int(image_token_start_index)
+        self._capture_decode_attention: bool = False
+        self._decode_attention_capture_requested: bool = False
+        self._latency_internal_keep_cache: Optional[Dict[str, Any]] = None
+        self._latency_seq_tensor_cache_hits: int = 0
+        self._latency_seq_tensor_cache_misses: int = 0
+
+    def attach(self) -> bool:
+        if self.backbone is None or not hasattr(self.backbone, "layers"):
+            return False
+        existing_backend = getattr(self.backbone, "_acgtp_internal_backend", None)
+        if existing_backend is self:
+            return True
+        if existing_backend is not None:
+            raise RuntimeError("another experimental internal pruning patch is already active")
+        if hasattr(self.backbone, "_acgtp_internal_original_forward") or hasattr(self.backbone, "_acgtp_original_forward"):
+            raise RuntimeError("another experimental internal pruning patch is already active")
+        if getattr(self.backbone.forward, "_acgtp_internal_wrapped", False):
+            raise RuntimeError("internal pruning forward is already wrapped without backend marker")
+        self.backbone._acgtp_internal_original_forward = self.backbone.forward
+        self.backbone._acgtp_internal_backend = self
+        wrapped_forward = _make_acgtp_internal_forward(self.backbone._acgtp_internal_original_forward, self)
+        setattr(wrapped_forward, "_acgtp_internal_wrapped", True)
+        self.backbone.forward = types.MethodType(
+            wrapped_forward,
+            self.backbone,
+        )
+        if self.language_model is not None:
+            setattr(self.language_model, "acgtp_internal_pruning_enabled", True)
+        return True
+
+    def detach(self) -> None:
+        if self.backbone is not None and hasattr(self.backbone, "_acgtp_internal_original_forward"):
+            self.backbone.forward = self.backbone._acgtp_internal_original_forward
+            delattr(self.backbone, "_acgtp_internal_original_forward")
+        if self.backbone is not None and hasattr(self.backbone, "_acgtp_internal_backend"):
+            delattr(self.backbone, "_acgtp_internal_backend")
+        if self.language_model is not None and hasattr(self.language_model, "acgtp_internal_pruning_enabled"):
+            setattr(self.language_model, "acgtp_internal_pruning_enabled", False)
+        self.pending_plan = None
+        self._current_visual_keep_indices = tuple()
+        self._current_visual_keep_tensor = None
+        self._latency_internal_keep_cache = None
+        self._latency_seq_tensor_cache_hits = 0
+        self._latency_seq_tensor_cache_misses = 0
+
+    def set_pending_plan(self, plan: InternalPruningPlan) -> None:
+        self.pending_plan = plan
+        history_len = max(1, int(plan.quota_config.get("history_length", 3) or 3))
+        if self.prefill_attention_history.maxlen != history_len:
+            self.prefill_attention_history = deque(list(self.prefill_attention_history)[-history_len:], maxlen=history_len)
+        if self.action_attention_history.maxlen != history_len:
+            self.action_attention_history = deque(list(self.action_attention_history)[-history_len:], maxlen=history_len)
+        latency_mode = bool(plan.quota_config.get("latency_mode", False))
+        capture_decode_attention_requested = bool(plan.quota_config.get("capture_decode_attention", False))
+        self._decode_attention_capture_requested = capture_decode_attention_requested
+        self._capture_decode_attention = bool(capture_decode_attention_requested and not latency_mode)
+        self.last_info = {
+            "enabled": True,
+            "mode": "internal_acgtp",
+            "plan_ready": True,
+            "applied": False,
+            "requested_prune_layer": int(plan.prune_layer),
+            "image_token_start_index": int(plan.image_token_start_index),
+            "image_token_length": int(plan.original_visual_tokens),
+            "original_visual_tokens": int(plan.original_visual_tokens),
+            "kept_visual_tokens": int(plan.kept_visual_tokens),
+            "pruned_visual_tokens": int(plan.pruned_visual_tokens),
+            "source": plan.source,
+            "internal_selection_mode": str(plan.quota_config.get("selection_mode", "legacy_keep")),
+            "internal_attention_enabled": bool(plan.quota_config.get("attention_enabled", True)),
+            "target_keep_ratio": plan.target_keep_ratio,
+            "internal_decode_attention_capture_requested": capture_decode_attention_requested,
+            "internal_decode_attention_capture_enabled": bool(self._capture_decode_attention),
+            "internal_decode_attention_capture_disabled_for_latency": bool(
+                latency_mode and capture_decode_attention_requested
+            ),
+        }
+
+    def _latency_internal_cache_key(self, plan: InternalPruningPlan) -> Optional[Tuple[Any, ...]]:
+        if not bool(plan.quota_config.get("latency_fast_path", False)):
+            return None
+        if not bool(plan.quota_config.get("functional_quota_enabled", True)):
+            return None
+        mode = str(plan.quota_config.get("selection_mode", "geo_guarded") or "geo_guarded").strip().lower()
+        if mode in {"off", "legacy", "legacy_keep", "geometry_only", "attention_diagnostic", "diagnostic", "dynamic"}:
+            return None
+        if bool(plan.quota_config.get("risk_adaptive_enabled", False)):
+            return None
+        n = int(plan.original_visual_tokens)
+        target_ratio = plan.target_keep_ratio
+        if target_ratio is None:
+            target_ratio = float(max(1, len(plan.visual_keep_indices))) / float(max(1, n))
+        target_ratio = max(0.0, min(1.0, float(target_ratio)))
+        target_k = max(1, min(n, int(round(float(n) * target_ratio))))
+        return (
+            int(n),
+            int(target_k),
+            int(plan.prune_layer),
+            int(plan.image_token_start_index),
+            mode,
+            round(float(target_ratio), 6),
+        )
+
+    def lookup_latency_internal_keep_cache(
+        self,
+        plan: InternalPruningPlan,
+        *,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.LongTensor], Optional[Dict[str, Any]]]:
+        start = time.perf_counter()
+
+        def _miss(reason: str, *, enabled: bool) -> Tuple[None, Dict[str, Any]]:
+            return None, {
+                "internal_latency_internal_plan_cache_enabled": bool(enabled),
+                "internal_latency_internal_plan_cache_hit": False,
+                "internal_latency_internal_plan_cache_reason": str(reason),
+                "internal_latency_internal_plan_cache_lookup_ms": (time.perf_counter() - start) * 1000.0,
+                "internal_latency_fast_path": bool(enabled),
+            }
+
+        key = self._latency_internal_cache_key(plan)
+        if key is None:
+            return _miss("disabled", enabled=False)
+        if not bool(plan.selector_metadata.get("acgtp_latency_plan_cache_hit", False)):
+            return _miss("hook_plan_cache_miss", enabled=True)
+        cached = self._latency_internal_keep_cache
+        if not cached or cached.get("key") != key:
+            return _miss("empty" if not cached else "key_mismatch", enabled=True)
+        keep_tuple = tuple(int(x) for x in cached.get("visual_keep_indices", ()))
+        cached_tensor = cached.get("visual_keep_tensor")
+        if torch.is_tensor(cached_tensor):
+            visual_keep = cached_tensor
+            if visual_keep.device != device or visual_keep.dtype != torch.long:
+                visual_keep = visual_keep.to(device=device, dtype=torch.long)
+            if int(visual_keep.numel()) <= 0:
+                return _miss("empty_keep_indices", enabled=True)
+        else:
+            if not keep_tuple:
+                return _miss("empty_keep_indices", enabled=True)
+            visual_keep = torch.as_tensor(keep_tuple, dtype=torch.long, device=device)
+        info = dict(cached.get("info") or {})
+        lookup_ms = (time.perf_counter() - start) * 1000.0
+        info.update(
+            {
+                "internal_latency_internal_plan_cache_enabled": True,
+                "internal_latency_internal_plan_cache_hit": True,
+                "internal_latency_internal_plan_cache_reason": "hit",
+                "internal_latency_internal_plan_cache_lookup_ms": float(lookup_ms),
+                "internal_latency_fast_path": True,
+                "internal_selector_total_ms": float(lookup_ms),
+                "internal_score_depth_edge_ms": 0.0,
+                "internal_score_layout_ms": 0.0,
+                "internal_score_contact_ms": 0.0,
+                "internal_score_motion_ms": 0.0,
+                "internal_quota_alloc_ms": 0.0,
+                "internal_quota_merge_ms": 0.0,
+                "internal_debug_record_ms": 0.0,
+                "internal_latency_contamination_debug": False,
+                "internal_attention_source": f"cached_{info.get('internal_attention_source') or 'internal_plan'}",
+            }
+        )
+        if keep_tuple:
+            info["_visual_keep_indices_tuple"] = keep_tuple
+        return visual_keep, info
+
+    def store_latency_internal_keep_cache(
+        self,
+        plan: InternalPruningPlan,
+        *,
+        visual_keep: torch.Tensor,
+        info: Dict[str, Any],
+    ) -> None:
+        key = self._latency_internal_cache_key(plan)
+        if key is None:
+            self._latency_internal_keep_cache = None
+            return
+        latency_mode = bool(plan.quota_config.get("latency_mode", False))
+        cached_visual_keep = visual_keep.detach()
+        if cached_visual_keep.dtype != torch.long:
+            cached_visual_keep = cached_visual_keep.to(dtype=torch.long)
+        if not cached_visual_keep.is_contiguous():
+            cached_visual_keep = cached_visual_keep.contiguous()
+        keep_tuple = info.get("_visual_keep_indices_tuple")
+        if keep_tuple is None and not latency_mode:
+            keep_tuple = tuple(int(x) for x in visual_keep.detach().cpu().tolist())
+        if keep_tuple is not None:
+            keep_tuple = tuple(int(x) for x in keep_tuple)
+            info["_visual_keep_indices_tuple"] = keep_tuple
+        else:
+            keep_tuple = tuple()
+        info.setdefault("internal_latency_internal_plan_cache_enabled", True)
+        info.setdefault("internal_latency_internal_plan_cache_hit", False)
+        info.setdefault("internal_latency_internal_plan_cache_reason", "stored")
+        info.setdefault("internal_latency_internal_plan_cache_lookup_ms", None)
+        cached_info = {
+            k: v
+            for k, v in info.items()
+            if not str(k).startswith("_") and isinstance(v, (str, int, float, bool, type(None)))
+        }
+        self._latency_internal_keep_cache = {
+            "key": key,
+            "visual_keep_indices": keep_tuple,
+            "visual_keep_tensor": cached_visual_keep,
+            "info": cached_info,
+            "seq_tensor_cache": {},
+        }
+
+    def lookup_latency_seq_tensor_cache(
+        self,
+        plan: InternalPruningPlan,
+        *,
+        visual_keep: torch.Tensor,
+        seq_len: int,
+        batch_size: int,
+        device: torch.device,
+        cache_position_is_default: bool,
+    ) -> Tuple[Optional[torch.LongTensor], Optional[torch.LongTensor], Optional[torch.LongTensor], Dict[str, Any]]:
+        start = time.perf_counter()
+        meta: Dict[str, Any] = {
+            "internal_latency_seq_tensor_cache_enabled": False,
+            "internal_latency_seq_tensor_cache_hit": False,
+            "internal_latency_seq_tensor_cache_reason": "disabled",
+            "internal_latency_seq_tensor_cache_lookup_ms": None,
+            "internal_latency_seq_tensor_cache_hits": int(self._latency_seq_tensor_cache_hits),
+            "internal_latency_seq_tensor_cache_misses": int(self._latency_seq_tensor_cache_misses),
+        }
+        if not bool(plan.quota_config.get("latency_fast_path", False)) or not bool(plan.quota_config.get("latency_mode", False)):
+            meta["internal_latency_seq_tensor_cache_lookup_ms"] = (time.perf_counter() - start) * 1000.0
+            return None, None, None, meta
+        if int(batch_size) != 1:
+            meta.update(
+                {
+                    "internal_latency_seq_tensor_cache_enabled": True,
+                    "internal_latency_seq_tensor_cache_reason": "batch_size",
+                    "internal_latency_seq_tensor_cache_lookup_ms": (time.perf_counter() - start) * 1000.0,
+                }
+            )
+            return None, None, None, meta
+        cached = self._latency_internal_keep_cache
+        expected_key = self._latency_internal_cache_key(plan)
+        if expected_key is None or not cached or cached.get("key") != expected_key:
+            meta.update(
+                {
+                    "internal_latency_seq_tensor_cache_enabled": True,
+                    "internal_latency_seq_tensor_cache_reason": "missing_internal_keep_cache",
+                    "internal_latency_seq_tensor_cache_lookup_ms": (time.perf_counter() - start) * 1000.0,
+                }
+            )
+            return None, None, None, meta
+
+        meta["internal_latency_seq_tensor_cache_enabled"] = True
+        seq_cache = cached.setdefault("seq_tensor_cache", {})
+        cache_key = (
+            int(seq_len),
+            str(device),
+            int(batch_size),
+            int(plan.original_visual_tokens),
+            int(plan.image_token_start_index),
+            int(plan.prune_layer),
+            int(visual_keep.numel()),
+            bool(cache_position_is_default),
+        )
+        item = seq_cache.get(cache_key)
+        if isinstance(item, dict):
+            keep_indices = item.get("keep_indices")
+            position_ids = item.get("position_ids")
+            cached_cache_position = item.get("cache_position")
+            if (
+                torch.is_tensor(keep_indices)
+                and torch.is_tensor(position_ids)
+                and keep_indices.device == device
+                and position_ids.device == device
+                and keep_indices.dtype == torch.long
+                and position_ids.dtype == torch.long
+            ):
+                if bool(cache_position_is_default) and not (
+                    torch.is_tensor(cached_cache_position)
+                    and cached_cache_position.device == device
+                    and cached_cache_position.dtype == torch.long
+                ):
+                    cached_cache_position = None
+                self._latency_seq_tensor_cache_hits += 1
+                meta.update(
+                    {
+                        "internal_latency_seq_tensor_cache_hit": True,
+                        "internal_latency_seq_tensor_cache_reason": "hit",
+                        "internal_latency_seq_tensor_cache_lookup_ms": (time.perf_counter() - start) * 1000.0,
+                        "internal_latency_seq_tensor_cache_hits": int(self._latency_seq_tensor_cache_hits),
+                        "internal_latency_seq_tensor_cache_misses": int(self._latency_seq_tensor_cache_misses),
+                    }
+                )
+                return keep_indices, position_ids, cached_cache_position, meta
+
+        keep_indices = plan.seq_keep_indices_from_visual(visual_keep, seq_len=seq_len, device=device)
+        position_ids = keep_indices.unsqueeze(0)
+        cached_cache_position = keep_indices if bool(cache_position_is_default) else None
+        seq_cache[cache_key] = {
+            "keep_indices": keep_indices.detach(),
+            "position_ids": position_ids.detach(),
+            "cache_position": cached_cache_position.detach() if torch.is_tensor(cached_cache_position) else None,
+        }
+        self._latency_seq_tensor_cache_misses += 1
+        meta.update(
+            {
+                "internal_latency_seq_tensor_cache_hit": False,
+                "internal_latency_seq_tensor_cache_reason": "stored",
+                "internal_latency_seq_tensor_cache_lookup_ms": (time.perf_counter() - start) * 1000.0,
+                "internal_latency_seq_tensor_cache_hits": int(self._latency_seq_tensor_cache_hits),
+                "internal_latency_seq_tensor_cache_misses": int(self._latency_seq_tensor_cache_misses),
+            }
+        )
+        return keep_indices, position_ids, cached_cache_position, meta
+
+    def consume_pending_plan(self) -> Optional[InternalPruningPlan]:
+        plan = self.pending_plan
+        self.pending_plan = None
+        return plan
+
+    def _history_score(self, n: int, device: torch.device, *, source: str) -> Tuple[torch.Tensor, bool, str]:
+        history = self.action_attention_history if source == "action" else self.prefill_attention_history
+        if not history:
+            return torch.zeros(n, dtype=torch.float32, device=device), False, "unavailable"
+        acc = torch.zeros(n, dtype=torch.float32, device=device)
+        weight_sum = 0.0
+        decay = 0.8
+        for i, item in enumerate(reversed(history)):
+            try:
+                arr = torch.as_tensor(item, dtype=torch.float32, device=device).reshape(-1)
+                if int(arr.numel()) != n:
+                    continue
+                w = float(decay ** i)
+                acc += w * arr
+                weight_sum += w
+            except Exception:
+                continue
+        if weight_sum <= 1e-8:
+            return torch.zeros(n, dtype=torch.float32, device=device), False, "unavailable"
+        return torch.clamp(acc / weight_sum, 0.0, 1.0), True, source
+
+    def _record_decode_attention(self, output: Any) -> None:
+        if not self._capture_decode_attention:
+            return
+        attentions = _extract_output_attentions(output)
+        if not attentions:
+            return
+        attn = attentions[-1]
+        if not torch.is_tensor(attn) or attn.ndim < 4:
+            return
+        try:
+            n = int(self._current_original_visual_tokens)
+            device = attn.device
+            if torch.is_tensor(self._current_visual_keep_tensor):
+                visual_keep = self._current_visual_keep_tensor
+                if visual_keep.device != device or visual_keep.dtype != torch.long:
+                    visual_keep = visual_keep.to(device=device, dtype=torch.long)
+            elif self._current_visual_keep_indices:
+                visual_keep = torch.as_tensor(self._current_visual_keep_indices, dtype=torch.long, device=device)
+            else:
+                return
+            if int(visual_keep.numel()) <= 0:
+                return
+            image_start = int(self._current_image_token_start_index)
+            col_start = image_start
+            col_end = min(int(attn.shape[-1]), image_start + int(visual_keep.numel()))
+            if col_end <= col_start:
+                return
+            block = attn.detach().to(dtype=torch.float32)[..., :, col_start:col_end]
+            reduced = torch.mean(block, dim=tuple(range(block.ndim - 1))).reshape(-1)
+            full = torch.zeros(n, dtype=torch.float32, device=device)
+            count = min(int(reduced.numel()), int(visual_keep.numel()))
+            full[visual_keep[:count]] = reduced[:count]
+            full = _norm01(full, torch.ones_like(full, dtype=torch.bool))
+            self.action_attention_history.append(tuple(float(x) for x in full.detach().cpu().tolist()))
+        except Exception:
+            return
+
+    def record_decode_call(
+        self,
+        *,
+        input_len: Optional[int],
+        cache_before: Optional[int],
+        cache_after: Optional[int],
+        cache_present: Optional[bool] = None,
+        cache_before_by_layer: Optional[List[int]] = None,
+        cache_after_by_layer: Optional[List[int]] = None,
+        cache_by_layer_omitted_for_latency: bool = False,
+        cache_scalar_omitted_for_latency: bool = False,
+        bookkeeping_ms: Optional[float] = None,
+    ) -> None:
+        self.decode_calls += 1
+        info = dict(self.last_info or {})
+        info["decode_calls"] = int(self.decode_calls)
+        info["last_decode_input_len"] = input_len
+        info["decode_cache_length_before"] = cache_before
+        info["decode_cache_length_after"] = cache_after
+        info["internal_decode_cache_present"] = cache_present
+        info["decode_cache_by_layer_omitted_for_latency"] = bool(cache_by_layer_omitted_for_latency)
+        info["decode_cache_scalar_omitted_for_latency"] = bool(cache_scalar_omitted_for_latency)
+        prefill_kv_reduction = None
+        try:
+            raw_reduction = info.get("internal_kv_cache_token_reduction_ratio")
+            prefill_kv_reduction = float(raw_reduction) if raw_reduction is not None else None
+        except Exception:
+            prefill_kv_reduction = None
+        cache_is_present = bool(cache_present)
+        if cache_present is None:
+            cache_is_present = bool((cache_before is not None and int(cache_before) > 0) or cache_before_by_layer)
+        uses_pruned_prefill_cache = bool(
+            cache_is_present
+            and prefill_kv_reduction is not None
+            and float(prefill_kv_reduction) > 0.0
+        )
+        info["internal_decode_pruning_applied"] = False
+        info["internal_decode_prefill_kv_reduction_ratio"] = prefill_kv_reduction
+        info["internal_decode_uses_pruned_prefill_cache"] = uses_pruned_prefill_cache
+        info["internal_decode_cache_benefit_source"] = (
+            "prefill_internal_kv_cache_token_reduction_ratio"
+            if uses_pruned_prefill_cache
+            else None
+        )
+        if uses_pruned_prefill_cache:
+            info["internal_decode_pruning_reason"] = "decode_bypasses_internal_pruning_reuses_prefill_pruned_cache"
+        elif not cache_is_present:
+            info["internal_decode_pruning_reason"] = "decode_bypasses_internal_pruning_no_past_cache"
+        elif prefill_kv_reduction is None:
+            info["internal_decode_pruning_reason"] = "decode_bypasses_internal_pruning_prefill_cache_reduction_unknown"
+        else:
+            info["internal_decode_pruning_reason"] = "decode_bypasses_internal_pruning_no_prefill_cache_reduction"
+        if bookkeeping_ms is not None:
+            previous_ms = float(info.get("internal_decode_bookkeeping_ms") or 0.0)
+            info["internal_decode_bookkeeping_ms"] = previous_ms + float(bookkeeping_ms)
+            info["last_decode_bookkeeping_ms"] = float(bookkeeping_ms)
+        info["internal_decode_attention_capture_requested"] = bool(self._decode_attention_capture_requested)
+        info["internal_decode_attention_capture_enabled"] = bool(self._capture_decode_attention)
+        if cache_before_by_layer is not None:
+            info["decode_cache_seq_len_before_by_layer"] = [int(x) for x in cache_before_by_layer]
+        if cache_after_by_layer is not None:
+            info["decode_cache_seq_len_after_by_layer"] = [int(x) for x in cache_after_by_layer]
+            info["decode_effective_kv_tokens_mean"] = _mean_int(cache_after_by_layer)
+            info["decode_short_cache_layer_count"] = _count_less_than(
+                cache_after_by_layer,
+                info.get("original_seq_length"),
+            )
+            info["decode_pruned_cache_layer_count"] = _count_equal(
+                cache_after_by_layer,
+                info.get("kept_seq_length"),
+            )
+        if cache_before is not None and cache_after is not None and input_len is not None:
+            info["decode_cache_consistent"] = bool(cache_after >= cache_before)
+        if cache_before_by_layer is not None and cache_after_by_layer is not None:
+            pairs = zip(cache_before_by_layer, cache_after_by_layer)
+            info["decode_cache_consistent_by_layer"] = bool(all(int(after) >= int(before) for before, after in pairs))
+        elif cache_by_layer_omitted_for_latency:
+            info["decode_cache_consistent_by_layer"] = None
+        self.last_info = info
+
+    def resolve_visual_keep_indices(
+        self,
+        plan: InternalPruningPlan,
+        *,
+        seq_len: int,
+        device: torch.device,
+        attention_weights: Optional[torch.Tensor],
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        selector_start = time.perf_counter()
+        score_depth_edge_ms = 0.0
+        score_layout_ms = 0.0
+        score_contact_ms = 0.0
+        score_motion_ms = 0.0
+        quota_alloc_ms = 0.0
+        quota_merge_ms = 0.0
+        debug_record_ms = 0.0
+        latency_mode = bool(plan.quota_config.get("latency_mode", False))
+        n = int(plan.original_visual_tokens)
+        valid = _payload_mask(plan, "valid_mask", n, device, default=True)
+        fill_mask = _payload_mask(plan, "constrained_fill_mask", n, device, default=True)
+        fallback = _sanitize_visual_indices(plan.visual_keep_indices, n, device=device)
+        target_ratio = plan.target_keep_ratio
+        if target_ratio is None:
+            target_ratio = float(max(1, int(fallback.numel()))) / float(max(1, n))
+        target_ratio = max(0.0, min(1.0, float(target_ratio)))
+        target_k = max(1, min(n, int(round(float(n) * target_ratio))))
+
+        mode = str(plan.quota_config.get("selection_mode", "geo_guarded") or "geo_guarded").strip().lower()
+        attention_enabled = bool(plan.quota_config.get("attention_enabled", True))
+        capture_attention = attention_enabled and mode not in {"off", "legacy", "legacy_keep", "geometry_only"}
+
+        score_start = time.perf_counter()
+        scene = _norm01(_payload_tensor(plan, "scene_scores", n, device), valid)
+        depth = _norm01(_payload_tensor(plan, "depth_scores", n, device), valid)
+        contact = _norm01(_payload_tensor(plan, "contact_scores", n, device), valid)
+        motion_raw = _payload_tensor(plan, "motion_scores", n, device)
+        motion_valid = bool(plan.geometry_payload.get("motion_corridor_valid", False))
+        motion = _norm01(motion_raw, valid) if motion_valid else torch.zeros(n, dtype=torch.float32, device=device)
+        action = _norm01(_payload_tensor(plan, "action_constraint_scores", n, device), valid)
+        geo_score = torch.maximum(action, torch.maximum(scene, torch.maximum(depth, torch.maximum(contact, motion))))
+        weighted_geo = torch.clamp(0.30 * scene + 0.30 * depth + 0.20 * contact + 0.20 * motion + 0.30 * action, 0.0, 1.0)
+        geo_score = torch.maximum(geo_score, weighted_geo)
+        score_depth_edge_ms = (time.perf_counter() - score_start) * 1000.0
+
+        score_start = time.perf_counter()
+        layout_score = _norm01(_payload_tensor(plan, "layout_score", n, device), valid)
+        if not bool(torch.any(layout_score > 0.0).item()):
+            layout_score = torch.maximum(scene, depth)
+        score_layout_ms = (time.perf_counter() - score_start) * 1000.0
+
+        score_start = time.perf_counter()
+        contact_score = _norm01(_payload_tensor(plan, "contact_score", n, device), valid)
+        if not bool(torch.any(contact_score > 0.0).item()):
+            contact_score = torch.maximum(contact, action)
+        score_contact_ms = (time.perf_counter() - score_start) * 1000.0
+
+        score_start = time.perf_counter()
+        motion_score = _norm01(_payload_tensor(plan, "motion_score", n, device), valid) if motion_valid else torch.zeros(n, dtype=torch.float32, device=device)
+        if motion_valid and not bool(torch.any(motion_score > 0.0).item()):
+            motion_score = motion
+        score_motion_ms = (time.perf_counter() - score_start) * 1000.0
+
+        sem_score, sem_available, sem_confidence = _text_to_visual_attention(
+            attention_weights if capture_attention else None,
+            image_start=int(plan.image_token_start_index),
+            image_len=n,
+            seq_len=int(seq_len),
+            device=device,
+        )
+        attention_source_name = "none"
+        if sem_available:
+            attention_source_name = (
+                "llm_materialized_text_to_vision_attention"
+                if torch.is_tensor(attention_weights) and attention_weights.ndim >= 4
+                else "llm_qk_text_to_vision"
+            )
+        hist_score, hist_available, hist_source = self._history_score(n, device, source="action")
+
+        hard_ratio = max(0.0, min(1.0, float(plan.quota_config.get("hard_protect_ratio", 0.60))))
+        sem_ratio = max(0.0, min(0.7, float(plan.quota_config.get("semantic_attention_ratio", 0.20))))
+        hist_ratio = max(0.0, min(0.7, float(plan.quota_config.get("historical_attention_ratio", 0.15))))
+        requires_geo_alignment = bool(plan.quota_config.get("attention_requires_geometry_alignment", True))
+
+        hard_k = max(1, min(target_k, int(round(float(target_k) * hard_ratio))))
+        sem_k = max(0, min(target_k, int(round(float(target_k) * sem_ratio)))) if sem_available else 0
+        hist_k = max(0, min(target_k, int(round(float(target_k) * hist_ratio)))) if hist_available else 0
+
+        diagnostic_only = mode in {"off", "legacy", "legacy_keep", "geometry_only", "attention_diagnostic", "diagnostic"}
+        latency_fast_path = (
+            bool(plan.quota_config.get("latency_fast_path", False))
+            and bool(plan.quota_config.get("functional_quota_enabled", True))
+            and not diagnostic_only
+            and mode != "dynamic"
+            and not bool(plan.quota_config.get("risk_adaptive_enabled", False))
+        )
+        if latency_fast_path:
+            explicit_protect_mask = _payload_mask(plan, "geo_protect_mask", n, device, default=False) & valid
+            quota_start = time.perf_counter()
+            quota_result = select_internal_quota_tokens(
+                n=n,
+                device=device,
+                valid=valid,
+                fill_mask=fill_mask,
+                fallback=fallback,
+                target_k=target_k,
+                target_ratio=target_ratio,
+                hard_k=hard_k,
+                sem_k=sem_k,
+                hist_k=hist_k,
+                sem_ratio=sem_ratio,
+                hist_ratio=hist_ratio,
+                requires_geo_alignment=requires_geo_alignment,
+                quota_config=plan.quota_config,
+                explicit_protect_mask=explicit_protect_mask,
+                geo_score=geo_score,
+                scene=scene,
+                depth=depth,
+                contact=contact,
+                motion=motion,
+                layout_score=layout_score,
+                contact_score=contact_score,
+                motion_score=motion_score,
+                sem_score=sem_score,
+                hist_score=hist_score,
+                motion_valid=motion_valid,
+                sem_available=sem_available,
+                hist_available=hist_available,
+            )
+            quota_alloc_ms = (time.perf_counter() - quota_start) * 1000.0
+            keep = quota_result.keep
+            functional_quotas = quota_result.functional_quotas
+            branch_selected_counts = quota_result.branch_selected_counts
+            branch_unique_counts = quota_result.branch_unique_counts
+            final_kept_count = int(keep.numel())
+            info = {
+                "internal_selection_mode": mode,
+                "internal_latency_fast_path": True,
+                "internal_attention_available": bool(sem_available),
+                "internal_attention_confidence": float(sem_confidence),
+                "internal_attention_source": attention_source_name,
+                "internal_historical_action_attention_available": bool(hist_available),
+                "internal_historical_action_attention_source": hist_source,
+                "internal_geo_attention_iou": None,
+                "internal_high_geometry_low_attention_count": None,
+                "internal_high_attention_low_geometry_count": None,
+                "internal_attention_dropped_geo_count": None,
+                "internal_pruned_geo_critical_count": None,
+                "internal_geo_protected_count": None,
+                "internal_geo_explicit_protected_count": None,
+                "internal_geo_explicit_protected_kept_count": None,
+                "internal_budget_raised_for_geo_protection": bool(quota_result.geo_budget_raised),
+                "internal_dynamic_risk": 0.0,
+                "internal_dynamic_physical_risk": None,
+                "internal_dynamic_depth_risk": None,
+                "internal_dynamic_contact_coverage": None,
+                "internal_dynamic_motion_coverage": None,
+                "internal_dynamic_action_coverage": None,
+                "internal_dynamic_attention_risk": 0.0,
+                "internal_dynamic_history_risk": 0.0,
+                "internal_dynamic_attention_disagreement": None,
+                "internal_dynamic_risk_level": "latency_fast_path",
+                "internal_dynamic_keep_ratio": float(quota_result.target_ratio),
+                "internal_dynamic_keep_k": int(quota_result.target_k),
+                "internal_quota_hard_k": int(quota_result.hard_k),
+                "internal_quota_semantic_attention_k": int(functional_quotas.get("sem", sem_k)),
+                "internal_quota_historical_attention_k": int(functional_quotas.get("hist", hist_k)),
+                "internal_functional_quota_enabled": True,
+                "internal_quota_layout_k": int(functional_quotas.get("layout", 0)),
+                "internal_quota_contact_k": int(functional_quotas.get("contact", 0)),
+                "internal_quota_motion_k": int(functional_quotas.get("motion", 0)),
+                "internal_quota_fill_k": int(functional_quotas.get("fill", 0)),
+                "internal_selected_by_geo_count": branch_selected_counts.get("geo", 0),
+                "internal_selected_by_layout_count": branch_selected_counts.get("layout", 0),
+                "internal_selected_by_contact_count": branch_selected_counts.get("contact", 0),
+                "internal_selected_by_motion_count": branch_selected_counts.get("motion", 0),
+                "internal_selected_by_semantic_attention_count": branch_selected_counts.get("sem", 0),
+                "internal_selected_by_historical_attention_count": branch_selected_counts.get("hist", 0),
+                "internal_selected_by_fill_count": branch_selected_counts.get("fill", 0),
+                "internal_selected_by_fallback_count": branch_selected_counts.get("fallback", 0),
+                "internal_unique_geo_count": branch_unique_counts.get("geo", 0),
+                "internal_unique_layout_count": branch_unique_counts.get("layout", 0),
+                "internal_unique_contact_count": branch_unique_counts.get("contact", 0),
+                "internal_unique_motion_count": branch_unique_counts.get("motion", 0),
+                "internal_unique_semantic_attention_count": branch_unique_counts.get("sem", 0),
+                "internal_unique_historical_attention_count": branch_unique_counts.get("hist", 0),
+                "internal_unique_fill_count": branch_unique_counts.get("fill", 0),
+                "internal_unique_fallback_count": branch_unique_counts.get("fallback", 0),
+                "internal_branch_selected_sum": int(quota_result.branch_selected_sum),
+                "internal_branch_unique_sum": int(quota_result.branch_unique_sum),
+                "internal_branch_overlap_count": int(quota_result.branch_overlap_count),
+                "internal_branch_overlap_ratio": float(quota_result.branch_overlap_ratio),
+                "internal_branch_unique_ratio": float(quota_result.branch_unique_ratio),
+                "internal_branch_sum_equals_kept": bool(quota_result.branch_sum_equals_kept),
+                "internal_branch_accounting_valid": bool(quota_result.branch_unique_sum == final_kept_count),
+                "internal_fallback_added_count": int(max(0, quota_result.fallback_added)),
+                "internal_attention_requires_geometry_alignment": bool(requires_geo_alignment),
+                "latency_mode": latency_mode,
+                "internal_selector_total_ms": (time.perf_counter() - selector_start) * 1000.0,
+                "internal_score_depth_edge_ms": float(score_depth_edge_ms),
+                "internal_score_layout_ms": float(score_layout_ms),
+                "internal_score_contact_ms": float(score_contact_ms),
+                "internal_score_motion_ms": float(score_motion_ms),
+                "internal_quota_alloc_ms": float(quota_alloc_ms),
+                "internal_quota_merge_ms": 0.0,
+                "internal_debug_record_ms": 0.0,
+                "internal_latency_contamination_debug": False,
+            }
+            return torch.unique(keep, sorted=True), info
+
+        dynamic_risk = 0.0
+        geo_attention_iou = None
+        sem_top_for_diag = _topk(sem_score, max(1, sem_k or hard_k), valid) if sem_available else torch.empty(0, dtype=torch.long, device=device)
+        geo_top_for_diag = _topk(geo_score, max(1, hard_k), valid)
+        geo_top_mask = _mask_from_indices(geo_top_for_diag, n, device)
+        sem_top_mask = _mask_from_indices(sem_top_for_diag, n, device)
+        if sem_available:
+            geo_attention_iou = _iou(geo_top_mask, sem_top_mask)
+
+        # ── Risk from PHYSICAL/ACTION evidence only (final-design P3) ──────────
+        # Coverage-based: how much of the scene is under contact / motion-corridor
+        # / action-constraint, plus their mean intensity. Peak is a small add-on
+        # only, so a single strong token cannot pin risk at high. Low geometry-
+        # attention IoU is NOT a risk source — it is diagnostic, and may add only
+        # a small bounded bonus when physical risk is ALREADY elevated.
+        n_valid = int(torch.sum(valid).item())
+        denom = float(max(1, n_valid))
+
+        def _coverage(score: torch.Tensor, thr: float) -> float:
+            return float(torch.sum((score > thr) & valid).item()) / denom
+
+        def _mean_valid(score: torch.Tensor) -> float:
+            return float(torch.mean(score[valid]).detach().cpu()) if n_valid > 0 else 0.0
+
+        contact_peak = float(torch.max(contact[valid]).detach().cpu()) if n_valid > 0 else 0.0
+        motion_peak = float(torch.max(motion[valid]).detach().cpu()) if n_valid > 0 else 0.0
+        action_peak = float(torch.max(action[valid]).detach().cpu()) if n_valid > 0 else 0.0
+        contact_cov = _coverage(contact, 0.45)
+        motion_cov = _coverage(motion, 0.45) if motion_valid else 0.0
+        action_cov = _coverage(action, 0.45)
+        contact_mean = _mean_valid(contact)
+        motion_mean = _mean_valid(motion) if motion_valid else 0.0
+        action_mean = _mean_valid(action)
+        # tunable weights (config-driven, safe defaults)
+        w_cov = float(plan.quota_config.get("risk_coverage_weight", 3.0))
+        w_mean = float(plan.quota_config.get("risk_mean_weight", 1.5))
+        w_peak = float(plan.quota_config.get("risk_peak_weight", 0.15))
+        coverage_term = max(contact_cov, motion_cov, action_cov)
+        mean_term = max(contact_mean, motion_mean, action_mean)
+        peak_term = max(contact_peak, motion_peak, action_peak)
+        physical_risk = max(0.0, min(1.0, w_cov * coverage_term + w_mean * mean_term + w_peak * peak_term))
+
+        # depth validity: poor depth → less trustworthy geometry → keep more.
+        depth_valid_ratio = plan.geometry_payload.get("dynamic_decision", {}).get("acgtp_dynamic_depth_valid_ratio")
+        if depth_valid_ratio is None:
+            depth_valid_ratio = float(n_valid) / float(max(1, n))
+        depth_risk = max(0.0, min(1.0, 1.0 - float(depth_valid_ratio)))
+
+        # attention disagreement: DIAGNOSTIC ONLY. Enters risk only as a small,
+        # capped bonus and only when physical risk is already elevated.
+        attention_disagreement = max(0.0, 1.0 - float(geo_attention_iou)) if geo_attention_iou is not None else 0.0
+        disagreement_gate = 1.0 if physical_risk >= float(plan.quota_config.get("risk_disagreement_gate", 0.45)) else 0.0
+        attention_risk = (
+            disagreement_gate
+            * attention_disagreement
+            * float(plan.quota_config.get("risk_disagreement_max_bonus", 0.10))
+        )
+        history_risk = 0.0
+        dynamic_risk = max(
+            0.0,
+            min(
+                1.0,
+                float(plan.quota_config.get("risk_physical_weight", 0.85)) * physical_risk
+                + float(plan.quota_config.get("risk_depth_weight", 0.15)) * depth_risk
+                + attention_risk,
+            ),
+        )
+
+        if mode == "dynamic" or bool(plan.quota_config.get("risk_adaptive_enabled", False)):
+            high_keep = float(plan.quota_config.get("high_risk_keep_ratio", 0.85))
+            med_keep = float(plan.quota_config.get("medium_risk_keep_ratio", 0.55))
+            low_keep = float(plan.quota_config.get("low_risk_keep_ratio", 0.40))
+            high_thr = float(plan.quota_config.get("risk_high_threshold", 0.65))
+            med_thr = float(plan.quota_config.get("risk_medium_threshold", 0.35))
+            if dynamic_risk >= high_thr:
+                target_ratio = min(1.0, high_keep)
+                risk_level = "high"
+            elif dynamic_risk >= med_thr:
+                target_ratio = min(1.0, med_keep)
+                risk_level = "medium"
+            else:
+                target_ratio = min(1.0, low_keep)
+                risk_level = "low"
+            target_k = max(1, min(n, int(round(float(n) * target_ratio))))
+            hard_k = max(1, min(target_k, int(round(float(target_k) * hard_ratio))))
+            sem_k = max(0, min(target_k, int(round(float(target_k) * sem_ratio)))) if sem_available else 0
+            hist_k = max(0, min(target_k, int(round(float(target_k) * hist_ratio)))) if hist_available else 0
+        else:
+            risk_level = "disabled"
+
+        if diagnostic_only:
+            keep = fallback
+            if int(keep.numel()) == 0:
+                keep = _topk(geo_score, target_k, valid)
+            keep = keep[:target_k] if int(keep.numel()) > target_k else keep
+            final_mask = _mask_from_indices(keep, n, device)
+            info = {
+                "internal_selection_mode": mode,
+                "internal_attention_available": bool(sem_available),
+                "internal_attention_confidence": float(sem_confidence),
+                "internal_attention_source": attention_source_name,
+                "internal_historical_action_attention_available": bool(hist_available),
+                "internal_historical_action_attention_source": hist_source,
+                "internal_geo_attention_iou": geo_attention_iou,
+                "internal_high_geometry_low_attention_count": int(torch.sum(geo_top_mask & ~sem_top_mask).item()) if sem_available else int(torch.sum(geo_top_mask).item()),
+                "internal_high_attention_low_geometry_count": int(torch.sum(sem_top_mask & ~geo_top_mask).item()) if sem_available else 0,
+                "internal_attention_dropped_geo_count": int(torch.sum(geo_top_mask & ~final_mask).item()),
+                "internal_pruned_geo_critical_count": int(torch.sum(geo_top_mask & ~final_mask).item()),
+                "internal_geo_protected_count": int(torch.sum(geo_top_mask).item()),
+                "internal_dynamic_risk": float(dynamic_risk),
+                "internal_dynamic_physical_risk": float(physical_risk),
+                "internal_dynamic_attention_risk": float(attention_risk),
+                "internal_dynamic_history_risk": float(history_risk),
+                "internal_dynamic_attention_disagreement": float(attention_disagreement),
+                "internal_dynamic_risk_level": risk_level,
+                "internal_dynamic_keep_ratio": float(target_ratio),
+                "internal_dynamic_keep_k": int(target_k),
+                "internal_selected_by_geo_count": int(torch.sum(final_mask & geo_top_mask).item()),
+                "internal_selected_by_semantic_attention_count": 0,
+                "internal_selected_by_historical_attention_count": 0,
+                "internal_selected_by_fill_count": 0,
+                "internal_selected_by_fallback_count": int(keep.numel()),
+                "internal_unique_geo_count": 0,
+                "internal_unique_layout_count": 0,
+                "internal_unique_contact_count": 0,
+                "internal_unique_motion_count": 0,
+                "internal_unique_semantic_attention_count": 0,
+                "internal_unique_historical_attention_count": 0,
+                "internal_unique_fill_count": 0,
+                "internal_unique_fallback_count": int(keep.numel()),
+                "internal_branch_selected_sum": int(keep.numel()),
+                "internal_branch_unique_sum": int(keep.numel()),
+                "internal_branch_overlap_count": 0,
+                "internal_branch_overlap_ratio": 0.0,
+                "internal_branch_unique_ratio": 1.0,
+                "internal_branch_sum_equals_kept": True,
+                "internal_branch_accounting_valid": True,
+            }
+            debug_start = time.perf_counter()
+            if sem_available:
+                self.prefill_attention_history.append(tuple(float(x) for x in sem_score.detach().cpu().tolist()))
+            debug_record_ms += (time.perf_counter() - debug_start) * 1000.0
+            info.update(
+                {
+                    "latency_mode": latency_mode,
+                    "internal_selector_total_ms": (time.perf_counter() - selector_start) * 1000.0,
+                    "internal_score_depth_edge_ms": float(score_depth_edge_ms),
+                    "internal_score_layout_ms": float(score_layout_ms),
+                    "internal_score_contact_ms": float(score_contact_ms),
+                    "internal_score_motion_ms": float(score_motion_ms),
+                    "internal_quota_alloc_ms": float(quota_alloc_ms),
+                    "internal_quota_merge_ms": float(quota_merge_ms),
+                    "internal_debug_record_ms": float(debug_record_ms),
+                    "internal_latency_contamination_debug": bool(latency_mode and debug_record_ms > 0.0),
+                }
+            )
+            return torch.unique(keep, sorted=True), info
+
+        explicit_protect_mask = _payload_mask(plan, "geo_protect_mask", n, device, default=False) & valid
+        quota_start = time.perf_counter()
+        quota_result = select_internal_quota_tokens(
+            n=n,
+            device=device,
+            valid=valid,
+            fill_mask=fill_mask,
+            fallback=fallback,
+            target_k=target_k,
+            target_ratio=target_ratio,
+            hard_k=hard_k,
+            sem_k=sem_k,
+            hist_k=hist_k,
+            sem_ratio=sem_ratio,
+            hist_ratio=hist_ratio,
+            requires_geo_alignment=requires_geo_alignment,
+            quota_config=plan.quota_config,
+            explicit_protect_mask=explicit_protect_mask,
+            geo_score=geo_score,
+            scene=scene,
+            depth=depth,
+            contact=contact,
+            motion=motion,
+            layout_score=layout_score,
+            contact_score=contact_score,
+            motion_score=motion_score,
+            sem_score=sem_score,
+            hist_score=hist_score,
+            motion_valid=motion_valid,
+            sem_available=sem_available,
+            hist_available=hist_available,
+        )
+        quota_alloc_ms = (time.perf_counter() - quota_start) * 1000.0
+        quota_merge_start = time.perf_counter()
+        keep = quota_result.keep
+        final_mask = quota_result.final_mask
+        geo_protect_mask = quota_result.geo_protect_mask
+        explicit_protect_mask = quota_result.explicit_protect_mask
+        explicit_protect_count = int(torch.sum(explicit_protect_mask).item())
+        final_kept_count = int(torch.sum(final_mask).item())
+        target_k = quota_result.target_k
+        target_ratio = quota_result.target_ratio
+        hard_k = quota_result.hard_k
+        functional_enabled = quota_result.functional_enabled
+        functional_quotas = quota_result.functional_quotas
+        branch_selected_counts = quota_result.branch_selected_counts
+        branch_unique_counts = quota_result.branch_unique_counts
+        branch_selected_sum = quota_result.branch_selected_sum
+        branch_unique_sum = quota_result.branch_unique_sum
+        branch_overlap_count = quota_result.branch_overlap_count
+        branch_overlap_ratio = quota_result.branch_overlap_ratio
+        branch_unique_ratio = quota_result.branch_unique_ratio
+        branch_sum_equals_kept = quota_result.branch_sum_equals_kept
+        fallback_added = quota_result.fallback_added
+        geo_budget_raised = quota_result.geo_budget_raised
+        quota_merge_ms = (time.perf_counter() - quota_merge_start) * 1000.0
+
+        debug_start = time.perf_counter()
+        if sem_available:
+            self.prefill_attention_history.append(tuple(float(x) for x in sem_score.detach().cpu().tolist()))
+        debug_record_ms += (time.perf_counter() - debug_start) * 1000.0
+
+        info = {
+            "internal_selection_mode": mode,
+            "internal_attention_available": bool(sem_available),
+            "internal_attention_confidence": float(sem_confidence),
+            "internal_attention_source": attention_source_name,
+            "internal_historical_action_attention_available": bool(hist_available),
+            "internal_historical_action_attention_source": hist_source,
+            "internal_geo_attention_iou": geo_attention_iou,
+            "internal_high_geometry_low_attention_count": int(torch.sum(geo_top_mask & ~sem_top_mask).item()) if sem_available else int(torch.sum(geo_top_mask).item()),
+            "internal_high_attention_low_geometry_count": int(torch.sum(sem_top_mask & ~geo_top_mask).item()) if sem_available else 0,
+            "internal_attention_dropped_geo_count": int(torch.sum(geo_top_mask & ~final_mask).item()),
+            "internal_pruned_geo_critical_count": int(torch.sum(explicit_protect_mask & ~final_mask).item()),
+            "internal_geo_protected_count": int(torch.sum(geo_protect_mask).item()),
+            "internal_geo_explicit_protected_count": int(explicit_protect_count),
+            "internal_geo_explicit_protected_kept_count": int(torch.sum(explicit_protect_mask & final_mask).item()),
+            "internal_budget_raised_for_geo_protection": bool(geo_budget_raised),
+            "internal_dynamic_risk": float(dynamic_risk),
+            "internal_dynamic_physical_risk": float(physical_risk),
+            "internal_dynamic_depth_risk": float(depth_risk),
+            "internal_dynamic_contact_coverage": float(contact_cov),
+            "internal_dynamic_motion_coverage": float(motion_cov),
+            "internal_dynamic_action_coverage": float(action_cov),
+            "internal_dynamic_attention_risk": float(attention_risk),
+            "internal_dynamic_history_risk": float(history_risk),
+            "internal_dynamic_attention_disagreement": float(attention_disagreement),
+            "internal_dynamic_risk_level": risk_level,
+            "internal_dynamic_keep_ratio": float(target_ratio),
+            "internal_dynamic_keep_k": int(target_k),
+            "internal_quota_hard_k": int(hard_k),
+            "internal_quota_semantic_attention_k": int(functional_quotas.get("sem", sem_k)) if functional_enabled else int(sem_k),
+            "internal_quota_historical_attention_k": int(functional_quotas.get("hist", hist_k)) if functional_enabled else int(hist_k),
+            "internal_functional_quota_enabled": bool(functional_enabled),
+            "internal_quota_layout_k": int(functional_quotas.get("layout", 0)) if functional_enabled else 0,
+            "internal_quota_contact_k": int(functional_quotas.get("contact", 0)) if functional_enabled else 0,
+            "internal_quota_motion_k": int(functional_quotas.get("motion", 0)) if functional_enabled else 0,
+            "internal_quota_fill_k": int(functional_quotas.get("fill", 0)) if functional_enabled else 0,
+            "internal_selected_by_geo_count": branch_selected_counts["geo"],
+            "internal_selected_by_layout_count": branch_selected_counts["layout"],
+            "internal_selected_by_contact_count": branch_selected_counts["contact"],
+            "internal_selected_by_motion_count": branch_selected_counts["motion"],
+            "internal_selected_by_semantic_attention_count": branch_selected_counts["sem"],
+            "internal_selected_by_historical_attention_count": branch_selected_counts["hist"],
+            "internal_selected_by_fill_count": branch_selected_counts["fill"],
+            "internal_selected_by_fallback_count": branch_selected_counts["fallback"],
+            "internal_unique_geo_count": branch_unique_counts["geo"],
+            "internal_unique_layout_count": branch_unique_counts["layout"],
+            "internal_unique_contact_count": branch_unique_counts["contact"],
+            "internal_unique_motion_count": branch_unique_counts["motion"],
+            "internal_unique_semantic_attention_count": branch_unique_counts["sem"],
+            "internal_unique_historical_attention_count": branch_unique_counts["hist"],
+            "internal_unique_fill_count": branch_unique_counts["fill"],
+            "internal_unique_fallback_count": branch_unique_counts["fallback"],
+            "internal_branch_selected_sum": branch_selected_sum,
+            "internal_branch_unique_sum": branch_unique_sum,
+            "internal_branch_overlap_count": branch_overlap_count,
+            "internal_branch_overlap_ratio": float(branch_overlap_ratio),
+            "internal_branch_unique_ratio": float(branch_unique_ratio),
+            "internal_branch_sum_equals_kept": branch_sum_equals_kept,
+            "internal_branch_accounting_valid": bool(branch_sum_equals_kept and branch_unique_sum == final_kept_count),
+            "internal_fallback_added_count": int(max(0, fallback_added)),
+            "internal_attention_requires_geometry_alignment": bool(requires_geo_alignment),
+            "latency_mode": latency_mode,
+            "internal_selector_total_ms": (time.perf_counter() - selector_start) * 1000.0,
+            "internal_score_depth_edge_ms": float(score_depth_edge_ms),
+            "internal_score_layout_ms": float(score_layout_ms),
+            "internal_score_contact_ms": float(score_contact_ms),
+            "internal_score_motion_ms": float(score_motion_ms),
+            "internal_quota_alloc_ms": float(quota_alloc_ms),
+            "internal_quota_merge_ms": float(quota_merge_ms),
+            "internal_debug_record_ms": float(debug_record_ms),
+            "internal_latency_contamination_debug": bool(latency_mode and debug_record_ms > 0.0),
+        }
+        return torch.unique(keep, sorted=True), info
+
+    def stats(self) -> Dict[str, Any]:
+        return dict(self.last_info or {})
+
+
+def _make_acgtp_internal_forward(original_forward, backend: ACGTPInternalPruningBackend):
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Any] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        is_prefill = inputs_embeds is not None and int(inputs_embeds.shape[1]) > 1
+        if not is_prefill:
+            latency_mode = bool((backend.last_info or {}).get("latency_mode", False))
+            decode_trace_enabled = not latency_mode
+            decode_bookkeeping_start = time.perf_counter()
+            input_len = None
+            if input_ids is not None and hasattr(input_ids, "shape"):
+                input_len = int(input_ids.shape[-1])
+            elif inputs_embeds is not None and hasattr(inputs_embeds, "shape"):
+                input_len = int(inputs_embeds.shape[1])
+            cache_before = None if latency_mode else _cache_seq_length(past_key_values)
+            cache_before_by_layer = _cache_layer_seq_lengths(past_key_values) if decode_trace_enabled else None
+            decode_output_attentions = bool(output_attentions or backend._capture_decode_attention)
+            decode_bookkeeping_ms = (time.perf_counter() - decode_bookkeeping_start) * 1000.0
+            output = original_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=decode_output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
+            decode_bookkeeping_start = time.perf_counter()
+            if backend._capture_decode_attention:
+                backend._record_decode_attention(output)
+            output_cache = None if latency_mode else _as_return_cache(output)
+            backend.record_decode_call(
+                input_len=input_len,
+                cache_before=cache_before,
+                cache_after=None if latency_mode else _cache_seq_length(output_cache),
+                cache_present=bool(
+                    (cache_before is not None and int(cache_before) > 0)
+                    or (latency_mode and past_key_values is not None)
+                ),
+                cache_before_by_layer=cache_before_by_layer,
+                cache_after_by_layer=_cache_layer_seq_lengths(output_cache) if decode_trace_enabled else None,
+                cache_by_layer_omitted_for_latency=not decode_trace_enabled,
+                cache_scalar_omitted_for_latency=latency_mode,
+                bookkeeping_ms=decode_bookkeeping_ms + ((time.perf_counter() - decode_bookkeeping_start) * 1000.0),
+            )
+            return output
+
+        plan = backend.consume_pending_plan()
+        if plan is None:
+            msg = "ACGTP internal pruning requested but no pending InternalPruningPlan was provided"
+            backend.last_info = {
+                "enabled": True,
+                "mode": "internal_acgtp",
+                "plan_ready": False,
+                "applied": False,
+                "disabled_reason": "missing_internal_plan",
+            }
+            if backend.fail_on_error:
+                raise RuntimeError(msg)
+            return original_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
+
+        if int(inputs_embeds.shape[0]) != 1:
+            msg = f"ACGTP internal pruning currently supports batch size 1, got {int(inputs_embeds.shape[0])}"
+            backend.last_info.update({"applied": False, "disabled_reason": "unsupported_batch_size"})
+            if backend.fail_on_error:
+                raise RuntimeError(msg)
+            return original_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+            )
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            use_cache = False
+
+        past_seen_tokens = 0
+        if use_cache:
+            if not isinstance(past_key_values, StaticCache):
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                past_seen_tokens = past_key_values.get_seq_length()
+
+        cache_position_generated_default = False
+        if cache_position is None:
+            if isinstance(past_key_values, StaticCache):
+                raise ValueError("cache_position is a required argument when using StaticCache.")
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
+            cache_position_generated_default = bool(int(past_seen_tokens) == 0)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = _update_causal_mask(self, attention_mask, inputs_embeds, cache_position, past_seen_tokens)
+        hidden_states = inputs_embeds
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
+
+        original_seq_length = int(inputs_embeds.shape[1])
+        total_layers = int(len(getattr(self, "layers", [])))
+        trace_enabled = bool(plan.quota_config.get("trace_enabled", True))
+        latency_mode = bool(plan.quota_config.get("latency_mode", False))
+        try_materialized_attn_requested = bool(plan.quota_config.get("try_output_attentions", False))
+        apply_prune_ms = 0.0
+        prefill_seq_len_before_layer: List[int] = []
+        prefill_seq_len_after_layer: List[int] = []
+        info = dict(backend.last_info or {})
+        info.update(
+            {
+                "enabled": True,
+                "mode": "internal_acgtp",
+                "plan_ready": True,
+                "applied": False,
+                "requested_prune_layer": int(plan.prune_layer),
+                "original_seq_length": original_seq_length,
+                "kept_seq_length": original_seq_length,
+                "pruned_seq_length": 0,
+                "original_visual_tokens": int(plan.original_visual_tokens),
+                "kept_visual_tokens": int(plan.kept_visual_tokens),
+                "pruned_visual_tokens": int(plan.pruned_visual_tokens),
+                "visual_tokens_at_llm_entry": int(plan.original_visual_tokens),
+                "visual_tokens_after_internal_prune": int(plan.kept_visual_tokens),
+                "image_token_start_index": int(plan.image_token_start_index),
+                "image_token_length": int(plan.original_visual_tokens),
+                "internal_total_layers": total_layers,
+                "internal_trace_enabled": trace_enabled,
+                "latency_mode": latency_mode,
+                "attn_implementation": _attn_implementation_name(getattr(self, "config", None)),
+                "output_attentions": bool(output_attentions),
+                "output_attentions_effective": bool(output_attentions),
+                "try_output_attentions": try_materialized_attn_requested,
+                "latency_contamination_attention": bool(latency_mode and output_attentions),
+                "multimodal_seq_len": original_seq_length,
+                "llm_input_seq_len": original_seq_length,
+                "decoder_first_layer_seq_len": None,
+                "attention_mask_shape": _shape_repr(attention_mask),
+                "position_ids_shape": _shape_repr(position_ids),
+                "cache_position_shape": _shape_repr(cache_position),
+                "cache_position_len": _numel_or_none(cache_position),
+                "source": plan.source,
+            }
+        )
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if trace_enabled:
+                prefill_seq_len_before_layer.append(int(hidden_states.shape[1]))
+            if int(layer_idx) == 0 and info.get("decoder_first_layer_seq_len") is None:
+                info["decoder_first_layer_seq_len"] = int(hidden_states.shape[1])
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            capture_for_pruning = bool(
+                int(layer_idx) == int(plan.prune_layer)
+                and bool(plan.quota_config.get("attention_enabled", True))
+                and str(plan.quota_config.get("selection_mode", "geo_guarded")).strip().lower()
+                not in {"off", "legacy", "legacy_keep", "geometry_only"}
+            )
+            try_materialized_attn = try_materialized_attn_requested
+            layer_output_attentions = bool(output_attentions or (capture_for_pruning and try_materialized_attn))
+            if layer_output_attentions:
+                info["output_attentions_effective"] = True
+                if latency_mode and (bool(output_attentions) or bool(capture_for_pruning and try_materialized_attn)):
+                    info["latency_contamination_attention"] = True
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=layer_output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+            hidden_states = layer_outputs[0]
+            layer_attn = layer_outputs[1] if layer_output_attentions else None
+            if output_attentions:
+                all_self_attns += (layer_attn,)
+            if use_cache:
+                next_decoder_cache = layer_outputs[2 if layer_output_attentions else 1]
+
+            if (not info.get("applied")) and int(layer_idx) == int(plan.prune_layer):
+                seq_len = int(hidden_states.shape[1])
+                visual_keep, fusion_info = backend.lookup_latency_internal_keep_cache(
+                    plan,
+                    device=hidden_states.device,
+                )
+                cache_probe_info = dict(fusion_info or {})
+                if visual_keep is None:
+                    attention_for_selection = layer_attn
+                    if capture_for_pruning and attention_for_selection is None:
+                        attention_for_selection = _qk_text_to_visual_attention(
+                            decoder_layer,
+                            hidden_states,
+                            image_start=int(plan.image_token_start_index),
+                            image_len=int(plan.original_visual_tokens),
+                        )
+                    visual_keep, fusion_info = backend.resolve_visual_keep_indices(
+                        plan,
+                        seq_len=seq_len,
+                        device=hidden_states.device,
+                        attention_weights=attention_for_selection,
+                    )
+                    for cache_key, cache_value in cache_probe_info.items():
+                        fusion_info.setdefault(cache_key, cache_value)
+                    backend.store_latency_internal_keep_cache(
+                        plan,
+                        visual_keep=visual_keep,
+                        info=fusion_info,
+                    )
+                (
+                    cached_keep_indices,
+                    cached_position_ids,
+                    cached_cache_position,
+                    seq_cache_info,
+                ) = backend.lookup_latency_seq_tensor_cache(
+                    plan,
+                    visual_keep=visual_keep,
+                    seq_len=seq_len,
+                    batch_size=int(hidden_states.shape[0]),
+                    device=hidden_states.device,
+                    cache_position_is_default=bool(cache_position_generated_default and int(past_seen_tokens) == 0),
+                )
+                keep_indices = (
+                    cached_keep_indices
+                    if torch.is_tensor(cached_keep_indices)
+                    else plan.seq_keep_indices_from_visual(visual_keep, seq_len=seq_len, device=hidden_states.device)
+                )
+                if int(keep_indices.numel()) < seq_len:
+                    apply_start = time.perf_counter()
+                    hidden_states = hidden_states.index_select(1, keep_indices)
+                    position_ids = cached_position_ids if torch.is_tensor(cached_position_ids) else keep_indices.unsqueeze(0)
+                    if torch.is_tensor(cached_cache_position):
+                        cache_position = cached_cache_position
+                    elif cache_position is not None and int(cache_position.numel()) >= seq_len:
+                        cache_position = cache_position.index_select(0, keep_indices)
+                    else:
+                        cache_position = keep_indices
+                    causal_mask = _update_causal_mask(self, None, hidden_states, cache_position, 0)
+                    pruned = None
+                    if not latency_mode:
+                        pruned = torch.arange(seq_len, dtype=torch.long, device=hidden_states.device)
+                        pruned = pruned[~torch.isin(pruned, keep_indices)]
+                    apply_prune_ms += (time.perf_counter() - apply_start) * 1000.0
+                    debug_start = time.perf_counter()
+                    visual_keep_tuple = fusion_info.get("_visual_keep_indices_tuple")
+                    backend._current_visual_keep_tensor = visual_keep.detach()
+                    if backend._capture_decode_attention and visual_keep_tuple is None:
+                        visual_keep_tuple = tuple(int(x) for x in visual_keep.detach().cpu().tolist())
+                        fusion_info["_visual_keep_indices_tuple"] = visual_keep_tuple
+                    backend._current_visual_keep_indices = (
+                        tuple(int(x) for x in visual_keep_tuple)
+                        if visual_keep_tuple is not None
+                        else tuple()
+                    )
+                    debug_extra_ms = (time.perf_counter() - debug_start) * 1000.0
+                    fusion_info["internal_debug_record_ms"] = float(fusion_info.get("internal_debug_record_ms") or 0.0) + float(debug_extra_ms)
+                    fusion_info["internal_latency_contamination_debug"] = bool(
+                        latency_mode and float(fusion_info.get("internal_debug_record_ms") or 0.0) > 0.0
+                    )
+                    backend._current_original_visual_tokens = int(plan.original_visual_tokens)
+                    backend._current_image_token_start_index = int(plan.image_token_start_index)
+                    large_indices_omitted = bool(latency_mode)
+                    info.update(
+                        {
+                            "applied": True,
+                            "pruning_layer": int(layer_idx),
+                            "kept_seq_length": int(keep_indices.numel()),
+                            "pruned_seq_length": int(seq_len - keep_indices.numel()),
+                            "kept_indices": None if large_indices_omitted else keep_indices.detach(),
+                            "pruned_indices": pruned.detach() if pruned is not None else None,
+                            "kept_indices_count": int(keep_indices.numel()),
+                            "pruned_indices_count": int(seq_len - keep_indices.numel()),
+                            "kept_indices_omitted_for_latency": large_indices_omitted,
+                            "pruned_indices_omitted_for_latency": bool(latency_mode and pruned is None),
+                            "visual_keep_indices": None if large_indices_omitted else visual_keep.detach(),
+                            "visual_keep_indices_count": int(visual_keep.numel()),
+                            "visual_keep_indices_omitted_for_latency": large_indices_omitted,
+                            "position_ids_length": int(position_ids.shape[-1]),
+                            "cache_position_length": int(cache_position.numel()),
+                            "position_ids_shape": _shape_repr(position_ids),
+                            "cache_position_shape": _shape_repr(cache_position),
+                            "cache_position_len": _numel_or_none(cache_position),
+                            "causal_mask_shape": tuple(int(x) for x in causal_mask.shape) if hasattr(causal_mask, "shape") else None,
+                            "kept_visual_tokens": int(visual_keep.numel()),
+                            "pruned_visual_tokens": int(plan.original_visual_tokens - int(visual_keep.numel())),
+                            "visual_tokens_after_internal_prune": int(visual_keep.numel()),
+                            "internal_apply_prune_ms": float(apply_prune_ms),
+                            "apply_prune_ms": float(apply_prune_ms),
+                        }
+                    )
+                    info.update(seq_cache_info)
+                    info.update(fusion_info)
+                else:
+                    info.update(
+                        {
+                            "applied": False,
+                            "disabled_reason": "keep_indices_full",
+                            "pruning_layer": int(layer_idx),
+                            "kept_seq_length": seq_len,
+                            "pruned_seq_length": 0,
+                        }
+                    )
+                    info.update(fusion_info)
+            if trace_enabled:
+                prefill_seq_len_after_layer.append(int(hidden_states.shape[1]))
+
+        hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        next_cache = None
+        if use_cache:
+            next_cache = next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
+
+        info["final_hidden_seq_length"] = int(hidden_states.shape[1])
+        info["prefill_cache_seq_length"] = _cache_seq_length(next_cache)
+        if trace_enabled:
+            kv_lengths = _cache_layer_seq_lengths(next_cache)
+            kept_seq = int(info.get("kept_seq_length") or info["final_hidden_seq_length"])
+            prune_layer = info.get("pruning_layer", info.get("requested_prune_layer"))
+            first_short_layer = None
+            for idx, seq_len_item in enumerate(prefill_seq_len_before_layer):
+                if int(seq_len_item) < int(original_seq_length):
+                    first_short_layer = int(idx)
+                    break
+            info.update(
+                {
+                    "prefill_seq_len_before_layer": [int(x) for x in prefill_seq_len_before_layer],
+                    "prefill_seq_len_after_layer": [int(x) for x in prefill_seq_len_after_layer],
+                    "prefill_kv_cache_seq_len_by_layer": [int(x) for x in kv_lengths] if kv_lengths is not None else None,
+                    "internal_first_short_layer": first_short_layer,
+                    "internal_full_length_layer_count": _count_equal(prefill_seq_len_before_layer, original_seq_length),
+                    "internal_shortened_layer_count": _count_less_than(prefill_seq_len_before_layer, original_seq_length),
+                    "internal_post_prune_layer_count": (
+                        max(0, total_layers - int(prune_layer) - 1)
+                        if prune_layer is not None
+                        else None
+                    ),
+                    "internal_post_prune_layer_ratio": (
+                        max(0.0, float(total_layers - int(prune_layer) - 1) / float(max(1, total_layers)))
+                        if prune_layer is not None
+                        else None
+                    ),
+                    "internal_kv_cache_full_length_layer_count": _count_equal(kv_lengths, original_seq_length),
+                    "internal_kv_cache_short_length_layer_count": _count_equal(kv_lengths, kept_seq),
+                    "internal_kv_cache_token_reduction_ratio": (
+                        None
+                        if kv_lengths is None
+                        else max(0.0, 1.0 - float(_mean_int(kv_lengths) or 0.0) / float(max(1, original_seq_length)))
+                    ),
+                    "internal_kv_cache_mean_seq_len": _mean_int(kv_lengths),
+                }
+            )
+        info.setdefault("internal_apply_prune_ms", float(apply_prune_ms))
+        info.setdefault("apply_prune_ms", float(apply_prune_ms))
+        info.setdefault("latency_contamination_attention", bool(latency_mode and info.get("output_attentions_effective")))
+        info.setdefault("latency_contamination_debug", bool(latency_mode and float(info.get("internal_debug_record_ms") or 0.0) > 0.0))
+        backend.last_info = info
+        self.acgtp_internal_pruning_info = info
+        self.pruning_info = info
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+    return forward
+
+
+def enable_acgtp_internal_pruning(
+    model: Any,
+    *,
+    prune_layer: int = 2,
+    image_token_start_index: int = 1,
+    image_token_length: int = 256,
+    fail_on_error: bool = True,
+) -> Optional[ACGTPInternalPruningBackend]:
+    backend = ACGTPInternalPruningBackend(
+        model,
+        prune_layer=prune_layer,
+        image_token_start_index=image_token_start_index,
+        image_token_length=image_token_length,
+        fail_on_error=fail_on_error,
+    )
+    if not backend.attach():
+        return None
+    return backend
+
+
+def disable_acgtp_internal_pruning(model: Any) -> None:
+    language_model = getattr(model, "language_model", None)
+    backbone = getattr(language_model, "model", None) if language_model is not None else None
+    backend = getattr(backbone, "_acgtp_internal_backend", None) if backbone is not None else None
+    if isinstance(backend, ACGTPInternalPruningBackend):
+        backend.detach()
+
+
+def get_acgtp_internal_pruning_info(model: Any) -> Dict[str, Any]:
+    language_model = getattr(model, "language_model", None)
+    backbone = getattr(language_model, "model", None) if language_model is not None else None
+    backend = getattr(backbone, "_acgtp_internal_backend", None) if backbone is not None else None
+    if isinstance(backend, ACGTPInternalPruningBackend):
+        return backend.stats()
+    info = getattr(backbone, "acgtp_internal_pruning_info", None) if backbone is not None else None
+    return dict(info) if isinstance(info, dict) else {}

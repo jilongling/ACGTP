@@ -1,0 +1,3229 @@
+"""
+metrics_logger.py
+
+Structured metrics logging for OpenVLA evaluation.
+Supports logging episode-level and step-level metrics with full action smoothness tracking,
+success/failure splits, and schema compatible with future token pruning integration.
+
+Output files:
+  - summary.json       : Overall experiment summary with all aggregates
+  - episodes.jsonl    : Per-episode details (one JSON object per line)
+  - episode_metrics.csv: Episode records in CSV format
+  - step_metrics.csv  : Step records in CSV format (optional)
+  - config.yaml       : Experiment configuration
+"""
+
+import csv
+import json
+import os
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+
+# ----------------------------------------------------------------------
+# Failure reasons
+# ----------------------------------------------------------------------
+class FailureReason:
+    SUCCESS = "success"
+    TIMEOUT = "timeout"
+    ENV_ERROR = "env_error"
+    MODEL_ERROR = "model_error"
+    UNKNOWN = "unknown_failure"
+
+
+# ----------------------------------------------------------------------
+# Type helpers
+# ----------------------------------------------------------------------
+def _to_python_native(obj: Any) -> Any:
+    """Recursively convert numpy/builtin types to Python native types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _to_python_native(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_python_native(item) for item in obj]
+    if isinstance(obj, (bool, int, float, str, type(None))):
+        return obj
+    try:
+        import numpy as np
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+    except ImportError:
+        pass
+    return obj
+
+
+def _mean_std(values: List[float]) -> Dict[str, Optional[float]]:
+    """Return mean/std/min/max; None if empty."""
+    if not values:
+        return {"mean": None, "std": None, "min": None, "max": None}
+    n = len(values)
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / n if n > 1 else 0.0
+    return {"mean": mean, "std": variance ** 0.5, "min": min(values), "max": max(values)}
+
+
+def _safe_mean(values: List[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
+
+
+def _nullable_list_mean(values: List[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
+
+
+def _nullable_list_std(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values) if len(values) > 1 else 0.0
+    return variance ** 0.5
+
+
+# ----------------------------------------------------------------------
+# Step-level metrics
+# ----------------------------------------------------------------------
+@dataclass
+class StepMetrics:
+    """Per-step metrics record (one per environment step)."""
+
+    # Identity
+    task_name: str = ""
+    episode_id: int = 0
+    step_id: int = 0
+
+    # Timing breakdown (all in ms)
+    preprocess_time_ms: float = 0.0          # Image + text preprocessing
+    vision_encoder_time_ms: float = 0.0        # ViT forward
+    projector_time_ms: float = 0.0              # MLP projector
+    llm_forward_time_ms: float = 0.0          # Full LLM forward pass
+    llm_prefill_time_ms: Optional[float] = None  # LLM prefill latency, if measured separately
+    llm_decode_time_ms: Optional[float] = None   # Autoregressive LLM decode latency, if measured separately
+    llm_timing_split_source: Optional[str] = None
+    llm_forward_calls: Optional[int] = None
+    llm_prefill_calls: Optional[int] = None
+    llm_decode_calls: Optional[int] = None
+    llm_prefill_seq_len: Optional[int] = None
+    llm_decode_query_tokens: Optional[int] = None
+    llm_decode_context_tokens: Optional[int] = None
+    llm_num_hidden_layers: Optional[int] = None
+    llm_hidden_size: Optional[int] = None
+    llm_intermediate_size: Optional[int] = None
+    llm_num_attention_heads: Optional[int] = None
+    llm_num_key_value_heads: Optional[int] = None
+    llm_head_dim: Optional[int] = None
+    profiler_exact_flops: Optional[float] = None
+    profiler_exact_flops_available: Optional[bool] = None
+    profiler_exact_flops_source: Optional[str] = None
+    profiler_exact_flops_scope: Optional[str] = None
+    profiler_exact_flops_profiled: Optional[bool] = None
+    profiler_exact_flops_events: Optional[int] = None
+    profiler_exact_flops_step_index: Optional[int] = None
+    profiler_trace_profiled: Optional[bool] = None
+    profiler_trace_step_index: Optional[int] = None
+    profiler_trace_cpu_table_path: Optional[str] = None
+    profiler_trace_cuda_table_path: Optional[str] = None
+    profiler_trace_chrome_path: Optional[str] = None
+    profiler_cuda_launch_kernel_count: Optional[int] = None
+    profiler_aten_mm_cuda_time_ms: Optional[float] = None
+    action_decode_time_ms: float = 0.0         # Token extraction + unnormalization
+    action_decode_time_ms_deprecated: Optional[float] = None
+    decode_impl: Optional[str] = None
+    decode_runtime_opt: Optional[str] = None
+    decode_runtime_opt_effective: Optional[str] = None
+    decode_runtime_opt_status: Optional[str] = None
+    decode_runtime_opt_error: Optional[str] = None
+    fixed_shape_decode_enabled: Optional[bool] = None
+    fixed_shape_decode_effective: Optional[bool] = None
+    fixed_shape_decode_fallback_reason: Optional[str] = None
+    fixed_shape_cache_preallocated: Optional[bool] = None
+    fixed_shape_cache_max_len: Optional[int] = None
+    fixed_shape_cache_num_layers: Optional[int] = None
+    fixed_shape_cache_layout: Optional[str] = None
+    fixed_shape_decode_shape_stable: Optional[bool] = None
+    fixed_shape_decode_used_flash_attn_kvcache: Optional[bool] = None
+    decode_cuda_graph_capture_attempted: Optional[bool] = None
+    decode_cuda_graph_capture_success: Optional[bool] = None
+    decode_cuda_graph_fallback_reason: Optional[str] = None
+    runtime_opt_fallback_reason: Optional[str] = None
+    hf_generate_total_ms: Optional[float] = None
+    prefill_forward_ms: Optional[float] = None
+    decode_loop_total_ms: Optional[float] = None
+    decode_num_tokens: Optional[int] = None
+    decode_per_token_ms: Optional[float] = None
+    decode_model_forward_ms: Optional[float] = None
+    decode_logits_head_ms: Optional[float] = None
+    decode_postprocess_ms: Optional[float] = None
+    action_token_cpu_transfer_ms: Optional[float] = None
+    decode_compile_setup_ms: Optional[float] = None
+    decode_python_overhead_ms: Optional[float] = None
+    cuda_sync_count: Optional[int] = None
+    implicit_cuda_sync_count: Optional[int] = None
+    decode_timing_scope: Optional[str] = None
+    decode_correctness_check_enabled: Optional[bool] = None
+    decode_correctness_check_passed: Optional[bool] = None
+    decode_correctness_reference_impl: Optional[str] = None
+    decode_correctness_max_token_diff: Optional[int] = None
+    decode_correctness_mismatch_count: Optional[int] = None
+    decode_correctness_action_max_abs_diff: Optional[float] = None
+    decode_latency_valid_for_clean_benchmark: Optional[bool] = None
+    output_hidden_states_effective: Optional[bool] = None
+    return_dict_in_generate_effective: Optional[bool] = None
+    transformers_version: Optional[str] = None
+    tokenizers_version: Optional[str] = None
+    torch_version: Optional[str] = None
+    cuda_version: Optional[str] = None
+    runtime_opt_mode: Optional[str] = None
+    pruning_enabled: Optional[bool] = None
+    prune_layer: Optional[int] = None
+    total_model_forward_time_ms: float = 0.0    # Sum of above (sanity check)
+    action_postprocess_time_ms: float = 0.0    # Gripper normalization
+    env_step_time_ms: float = 0.0              # Simulator step
+    total_step_wall_time_ms: float = 0.0      # Observation-in to env-step-done wall time
+
+    # CUDA latency (torch.cuda.Event, GPU-only core inference)
+    cuda_latency_ms: Optional[float] = None
+
+    # GPU memory
+    gpu_memory_mb: float = 0.0
+
+    # Action data
+    raw_action: List[float] = field(default_factory=list)
+
+    # Action smoothness
+    delta_action: float = 0.0   # ||a_t - a_{t-1}||
+    jerk_action: float = 0.0     # ||a_t - 2a_{t-1} + a_{t-2}||
+    gripper_changed: bool = False
+
+    # Extension fields (null if not available / not measured)
+    # Token pruning
+    num_visual_tokens_original: Optional[int] = None
+    num_visual_tokens_kept: Optional[int] = None
+    num_visual_tokens_pruned: Optional[int] = None
+    num_visual_tokens_dropped: Optional[int] = None
+    num_visual_tokens_original_total: Optional[int] = None
+    num_visual_tokens_original_per_encoder: Optional[Dict[str, int]] = None
+    num_visual_tokens_kept_total: Optional[int] = None
+    num_visual_tokens_per_encoder: Optional[Dict[str, int]] = None
+    num_processor_visual_tokens_estimated: Optional[int] = None
+    num_processor_visual_tokens_per_encoder: Optional[Dict[str, int]] = None
+    num_projector_visual_tokens_original: Optional[int] = None
+    num_projector_visual_tokens_kept: Optional[int] = None
+    num_projector_visual_tokens_pruned: Optional[int] = None
+    num_llm_visual_tokens: Optional[int] = None
+    protected_token_ratio: Optional[float] = None
+    pruned_token_ratio: Optional[float] = None
+    geometry_expert_time_ms: Optional[float] = None
+    token_scoring_time_ms: Optional[float] = None
+    mask_apply_time_ms: Optional[float] = None
+    pruning_overhead_time_ms: Optional[float] = None
+    effective_model_forward_time_ms: Optional[float] = None
+    # Misc
+    pruning_strategy: str = "none"
+    pruning_method: str = "none"
+    keep_ratio: float = 1.0
+    requested_keep_ratio: Optional[float] = None
+    keep_ratio_source: Optional[str] = None
+    effective_keep_count: Optional[int] = None
+    original_token_count: Optional[int] = None
+    effective_retention: Optional[float] = None
+    projector_retention: Optional[float] = None
+    internal_retention: Optional[float] = None
+    effective_visual_tokens_for_llm: Optional[int] = None
+    original_visual_tokens: Optional[int] = None
+    kept_visual_tokens: Optional[int] = None
+    pruned_visual_tokens: Optional[int] = None
+    llm_input_seq_len_before_prune: Optional[int] = None
+    llm_input_seq_len_after_prune: Optional[int] = None
+    llm_input_seq_len_pruned: Optional[int] = None
+    visual_token_count_before_prune: Optional[int] = None
+    visual_token_count_after_prune: Optional[int] = None
+    multimodal_seq_len: Optional[int] = None
+    llm_input_seq_len: Optional[int] = None
+    decoder_first_layer_seq_len: Optional[int] = None
+    llm_forward_input_ids_shape: Optional[str] = None
+    llm_forward_inputs_embeds_shape: Optional[str] = None
+    llm_attention_mask_shape: Optional[str] = None
+    llm_position_ids_shape: Optional[str] = None
+    llm_cache_position_shape: Optional[str] = None
+    llm_cache_position_len: Optional[int] = None
+    attention_mask_shape: Optional[str] = None
+    position_ids_shape: Optional[str] = None
+    cache_position_shape: Optional[str] = None
+    cache_position_len: Optional[int] = None
+    attn_implementation: Optional[str] = None
+    output_attentions: Optional[bool] = None
+    output_attentions_effective: Optional[bool] = None
+    try_output_attentions: Optional[bool] = None
+    latency_mode: Optional[bool] = None
+    core_inference_mode: Optional[bool] = None
+    torch_grad_enabled_during_model_forward: Optional[bool] = None
+    torch_inference_mode_enabled_during_model_forward: Optional[bool] = None
+    latency_contamination_attention: Optional[bool] = None
+    latency_contamination_debug: Optional[bool] = None
+    latency_contamination_reason: Optional[str] = None
+    preprocess_ms: Optional[float] = None
+    vision_encoder_ms: Optional[float] = None
+    projector_ms: Optional[float] = None
+    selector_total_ms: Optional[float] = None
+    score_depth_edge_ms: Optional[float] = None
+    score_contact_ms: Optional[float] = None
+    score_layout_ms: Optional[float] = None
+    score_motion_ms: Optional[float] = None
+    quota_alloc_ms: Optional[float] = None
+    quota_merge_ms: Optional[float] = None
+    debug_record_ms: Optional[float] = None
+    apply_prune_ms: Optional[float] = None
+    llm_prefill_ms: Optional[float] = None
+    llm_decode_ms: Optional[float] = None
+    llm_total_ms: Optional[float] = None
+    model_forward_total_ms: Optional[float] = None
+    wall_step_ms: Optional[float] = None
+    internal_selector_total_ms: Optional[float] = None
+    internal_score_depth_edge_ms: Optional[float] = None
+    internal_score_contact_ms: Optional[float] = None
+    internal_score_layout_ms: Optional[float] = None
+    internal_score_motion_ms: Optional[float] = None
+    internal_quota_alloc_ms: Optional[float] = None
+    internal_quota_merge_ms: Optional[float] = None
+    internal_debug_record_ms: Optional[float] = None
+    internal_apply_prune_ms: Optional[float] = None
+    internal_latency_fast_path: Optional[bool] = None
+    internal_latency_internal_plan_cache_enabled: Optional[bool] = None
+    internal_latency_internal_plan_cache_hit: Optional[bool] = None
+    internal_latency_internal_plan_cache_reason: Optional[str] = None
+    internal_latency_internal_plan_cache_lookup_ms: Optional[float] = None
+    internal_latency_seq_tensor_cache_enabled: Optional[bool] = None
+    internal_latency_seq_tensor_cache_hit: Optional[bool] = None
+    internal_latency_seq_tensor_cache_reason: Optional[str] = None
+    internal_latency_seq_tensor_cache_lookup_ms: Optional[float] = None
+    internal_latency_seq_tensor_cache_hits: Optional[int] = None
+    internal_latency_seq_tensor_cache_misses: Optional[int] = None
+
+    # Geometry scoring fields (null if geometry not enabled)
+    token_mapping_time_ms: Optional[float] = None
+    geometry_score_time_ms: Optional[float] = None
+    pruning_time_ms: Optional[float] = None
+    depth_fetch_ms: Optional[float] = None
+    depth_sample_ms: Optional[float] = None
+    depth_edge_score_ms: Optional[float] = None
+    token_xyz_projection_ms: Optional[float] = None
+    score_fusion_ms: Optional[float] = None
+    depth_sampling_ms: Optional[float] = None
+    score_compute_ms: Optional[float] = None
+    selection_ms: Optional[float] = None
+    gather_ms: Optional[float] = None
+    edge_score_ms: Optional[float] = None
+    robot_mapping_ms: Optional[float] = None
+    near_score_ms: Optional[float] = None
+    corridor_score_ms: Optional[float] = None
+    contact_score_ms: Optional[float] = None
+    edge_selection_ms: Optional[float] = None
+    geo_selection_ms: Optional[float] = None
+    diverse_selection_ms: Optional[float] = None
+    final_merge_ms: Optional[float] = None
+    topk_pruning_ms: Optional[float] = None
+    keep_indices_sorted: Optional[bool] = None
+    duplicate_indices_count: Optional[int] = None
+    fallback_used: Optional[bool] = None
+    fallback_reason: Optional[str] = None
+    model_forward_ms: Optional[float] = None
+    end_to_end_step_wall_time_ms: Optional[float] = None
+    geometry_total_time_ms: Optional[float] = None
+    visualization_time_ms: Optional[float] = None
+    hook_total_time_ms: Optional[float] = None
+    hook_total_ms: Optional[float] = None
+
+    # Score statistics (per-step, null if geometry not enabled)
+    geometry_score_mean: Optional[float] = None
+    geometry_score_max: Optional[float] = None
+    geometry_score_std: Optional[float] = None
+    distance_score_mean: Optional[float] = None
+    direction_score_mean: Optional[float] = None
+    depth_edge_score_mean: Optional[float] = None
+    motion_cone_score_mean: Optional[float] = None
+    motion_cone_score_max: Optional[float] = None
+    workspace_score_mean: Optional[float] = None
+    workspace_score_max: Optional[float] = None
+    contact_risk_score_mean: Optional[float] = None
+    contact_risk_score_max: Optional[float] = None
+    valid_token_ratio: Optional[float] = None
+    geometry_available: Optional[bool] = None
+    robot_state_available: Optional[bool] = None
+    camera_available: Optional[bool] = None
+    d_min: Optional[float] = None
+    d_mean_topk: Optional[float] = None
+    mean_near_score: Optional[float] = None
+    max_near_score: Optional[float] = None
+    motion_norm: Optional[float] = None
+    corridor_strength_mean: Optional[float] = None
+    corridor_strength_topk_mean: Optional[float] = None
+    corridor_active: Optional[bool] = None
+    d_corridor_min: Optional[float] = None
+    d_corridor_mean_topk: Optional[float] = None
+    dynamic_enabled: Optional[bool] = None
+    dynamic_phase: Optional[str] = None
+    dynamic_keep_ratio: Optional[float] = None
+    geo_risk_level: Optional[str] = None
+    geo_risk_score: Optional[float] = None
+    dynamic_keep_reason: Optional[str] = None
+    num_high_contact_tokens: Optional[int] = None
+    num_valid_3d_tokens: Optional[int] = None
+    dynamic_keep_k: Optional[int] = None
+    d_topk_mean: Optional[float] = None
+    corridor_strength: Optional[float] = None
+    edge_concentration: Optional[float] = None
+    valid_depth_ratio: Optional[float] = None
+    phase_far_count: Optional[int] = None
+    phase_mid_count: Optional[int] = None
+    phase_near_count: Optional[int] = None
+    phase_fallback_safe_count: Optional[int] = None
+    interaction_lock: Optional[bool] = None
+    interaction_lock_reason: Optional[str] = None
+    contact_risk_lock_ratio: Optional[float] = None
+    gripper_proximity_lock_ratio: Optional[float] = None
+    region_stability_lock_ratio: Optional[float] = None
+    temporal_stability: Optional[float] = None
+    history_length: Optional[int] = None
+    score_ema_enabled: Optional[bool] = None
+    score_ema_available: Optional[bool] = None
+    # P1-1: Score component is_none flags (populated by hybrid_v1 branch)
+    contact_risk_scores_is_none: Optional[bool] = None
+    motion_cone_scores_is_none: Optional[bool] = None
+    workspace_scores_is_none: Optional[bool] = None
+    # P1-1: Nonzero ratio for each score component
+    contact_nonzero_ratio: Optional[float] = None
+    motion_cone_nonzero_ratio: Optional[float] = None
+    workspace_nonzero_ratio: Optional[float] = None
+    # P1-1: temporal_v1 semantics fix
+    temporal_enabled: Optional[bool] = None
+    interaction_lock_triggered: Optional[bool] = None
+    interaction_lock_reason: Optional[str] = None
+    lock_condition_failed_reason: Optional[str] = None
+    topk_contact_lock: Optional[bool] = None
+    elevated_current_lock: Optional[bool] = None
+    gripper_lock: Optional[bool] = None
+    region_lock: Optional[bool] = None
+    K_total: Optional[int] = None
+    K_edge_target: Optional[int] = None
+    K_geo_target: Optional[int] = None
+    K_diverse_target: Optional[int] = None
+    K_edge_actual: Optional[int] = None
+    K_geo_actual: Optional[int] = None
+    K_diverse_actual: Optional[int] = None
+    selected_by_edge_count: Optional[int] = None
+    selected_by_geo_count: Optional[int] = None
+    selected_by_diverse_count: Optional[int] = None
+    edge_score_mean: Optional[float] = None
+    edge_score_topk_mean: Optional[float] = None
+    near_contact_score_mean: Optional[float] = None
+    near_contact_score_topk_mean: Optional[float] = None
+    corridor_contact_score_mean: Optional[float] = None
+    corridor_contact_score_topk_mean: Optional[float] = None
+    geo_contact_score_mean: Optional[float] = None
+    geo_contact_score_topk_mean: Optional[float] = None
+    overlap_edge_geo_before_dedup: Optional[int] = None
+    is_warmup_step: Optional[bool] = None
+
+    # New diagnostic fields: action
+    action_shape: Optional[str] = None
+    action_dtype: Optional[str] = None
+    action_min: Optional[float] = None
+    action_max: Optional[float] = None
+    action_mean: Optional[float] = None
+    action_std: Optional[float] = None
+    action_has_nan: Optional[bool] = None
+    action_has_inf: Optional[bool] = None
+
+    # New diagnostic fields: depth
+    depth_min: Optional[float] = None
+    depth_max: Optional[float] = None
+    depth_mean: Optional[float] = None
+    depth_valid_ratio: Optional[float] = None
+    # P0: Depth conversion metadata (populated by geometry pipeline)
+    depth_source_key: Optional[str] = None
+    depth_conversion: Optional[str] = None
+    depth_is_metric: Optional[bool] = None
+    depth_unit: Optional[str] = None
+    depth_sim_available: Optional[bool] = None
+    # Transform convention (P0-4 audit: T_robot_cam_forward)
+    transform_convention: Optional[str] = None
+    transform_inverse_used: Optional[bool] = None
+    transform_source: Optional[str] = None
+    transform_convention_verified: Optional[bool] = None
+    transform_convention_evidence: Optional[str] = None
+    depth_raw_min: Optional[float] = None
+    depth_raw_max: Optional[float] = None
+    depth_raw_mean: Optional[float] = None
+    depth_raw_std: Optional[float] = None
+    depth_metric_min: Optional[float] = None
+    depth_metric_max: Optional[float] = None
+    depth_metric_mean: Optional[float] = None
+    depth_metric_std: Optional[float] = None
+
+    # New diagnostic fields: 3D token geometry
+    points_robot_min_xyz: Optional[str] = None
+    points_robot_max_xyz: Optional[str] = None
+    points_cam_min_xyz: Optional[str] = None
+    points_cam_max_xyz: Optional[str] = None
+    extrinsics_available: Optional[bool] = None
+    intrinsics_available: Optional[bool] = None
+    camera_frame_name: Optional[str] = None
+    geometry_frame_name: Optional[str] = None
+
+    # New diagnostic fields: robot state / gripper
+    ee_position: Optional[str] = None
+    robot_state_valid: Optional[bool] = None
+    motion_direction_valid: Optional[bool] = None
+    motion_direction_xyz: Optional[str] = None
+    distance_to_gripper_min: Optional[float] = None
+    distance_to_gripper_mean: Optional[float] = None
+    distance_to_gripper_max: Optional[float] = None
+
+    # Score component distribution stats
+    depth_edge_score_std: Optional[float] = None
+    depth_edge_score_min: Optional[float] = None
+    depth_edge_score_p50: Optional[float] = None
+    depth_edge_score_p90: Optional[float] = None
+    depth_edge_score_max: Optional[float] = None
+    depth_edge_score_positive_ratio: Optional[float] = None
+    distance_score_std: Optional[float] = None
+    distance_score_min: Optional[float] = None
+    distance_score_p50: Optional[float] = None
+    distance_score_p90: Optional[float] = None
+    distance_score_max: Optional[float] = None
+    motion_cone_score_std: Optional[float] = None
+    motion_cone_score_min: Optional[float] = None
+    motion_cone_score_p50: Optional[float] = None
+    motion_cone_score_p90: Optional[float] = None
+    motion_cone_score_positive_ratio: Optional[float] = None
+    motion_cone_score_zero_ratio: Optional[float] = None
+    motion_dir_norm_mean: Optional[float] = None
+    motion_dir_norm_min: Optional[float] = None
+    motion_dir_norm_max: Optional[float] = None
+    workspace_score_std: Optional[float] = None
+    contact_risk_score_std: Optional[float] = None
+    contact_risk_score_min: Optional[float] = None
+    contact_risk_score_p50: Optional[float] = None
+    contact_risk_score_p90: Optional[float] = None
+    final_geometry_score_std: Optional[float] = None
+    final_geometry_score_min: Optional[float] = None
+    final_geometry_score_p50: Optional[float] = None
+    final_geometry_score_p90: Optional[float] = None
+    final_geometry_score_max: Optional[float] = None
+    # Selected token score stats
+    selected_depth_edge_score_mean: Optional[float] = None
+    selected_distance_score_mean: Optional[float] = None
+    selected_motion_cone_score_mean: Optional[float] = None
+    selected_workspace_score_mean: Optional[float] = None
+    selected_contact_risk_score_mean: Optional[float] = None
+    selected_final_score_mean: Optional[float] = None
+    # points_robot mean/std
+    points_robot_mean_xyz: Optional[str] = None
+    points_robot_std_xyz: Optional[str] = None
+    # camera frame availability
+    points_cam_available: Optional[bool] = None
+    points_cam_unavailable_reason: Optional[str] = None
+    # Hybrid quota union stats
+    selected_by_depth_edge_count: Optional[int] = None
+    selected_by_robot_geo_count: Optional[int] = None
+    selected_by_uniform_count: Optional[int] = None
+    selected_by_fill_count: Optional[int] = None
+    depth_edge_quota_count: Optional[int] = None
+    robot_geo_quota_count: Optional[int] = None
+    uniform_quota_count: Optional[int] = None
+    fill_count: Optional[int] = None
+    overlap_depth_robot_geo: Optional[int] = None
+    # Hybrid v1 / temporal fields
+    hybrid_score_mean: Optional[float] = None
+    hybrid_score_max: Optional[float] = None
+    hybrid_score_std: Optional[float] = None
+    edge_score_mean: Optional[float] = None
+    edge_score_max: Optional[float] = None
+    near_score_mean: Optional[float] = None
+    near_score_max: Optional[float] = None
+    contact_score_mean: Optional[float] = None
+    contact_score_max: Optional[float] = None
+    corridor_score_mean: Optional[float] = None
+    corridor_score_max: Optional[float] = None
+    diversity_score_mean: Optional[float] = None
+    diversity_score_max: Optional[float] = None
+    selected_grid_coverage_ratio: Optional[float] = None
+    selected_token_grid_entropy: Optional[float] = None
+    adaptive_contact_threshold: Optional[float] = None
+    adaptive_threshold_mean: Optional[float] = None
+    adaptive_threshold_max: Optional[float] = None
+    ema_used_for_selection: Optional[bool] = None
+    score_ema_available: Optional[bool] = None
+    lock_condition_failed_reason: Optional[str] = None
+    topk_contact_lock: Optional[bool] = None
+    elevated_current_lock: Optional[bool] = None
+    gripper_lock: Optional[bool] = None
+    region_lock: Optional[bool] = None
+    actual_keep_ratio: Optional[float] = None
+    hook_overhead_ms: Optional[float] = None
+    # ---- P1-1: Token selection attribution / top-k competition diagnostics ----
+    # Basic token counts
+    selected_token_count: Optional[int] = None
+    dropped_token_count: Optional[int] = None
+    selected_token_ratio: Optional[float] = None
+    dropped_token_ratio: Optional[float] = None
+    retention_ratio: Optional[float] = None
+    # Top-k overlap competition (depth_edge vs robot_geo vs final)
+    depth_edge_topk_count: Optional[int] = None
+    robot_geo_topk_count: Optional[int] = None  # legacy: hybrid/final-score top-k
+    hybrid_final_score_topk_count: Optional[int] = None
+    final_selected_count: Optional[int] = None
+    depth_edge_topk_kept_in_final_count: Optional[int] = None
+    robot_geo_topk_kept_in_final_count: Optional[int] = None  # legacy
+    hybrid_final_score_topk_kept_count: Optional[int] = None
+    depth_edge_topk_dropped_count: Optional[int] = None
+    robot_geo_topk_dropped_count: Optional[int] = None  # legacy
+    hybrid_final_score_topk_dropped_count: Optional[int] = None
+    depth_edge_topk_dropped_ratio: Optional[float] = None
+    robot_geo_topk_dropped_ratio: Optional[float] = None  # legacy
+    hybrid_final_score_topk_dropped_ratio: Optional[float] = None
+    overlap_depth_edge_robot_geo_count: Optional[int] = None
+    overlap_depth_edge_robot_geo_ratio: Optional[float] = None
+    selected_overlap_robot_geo_depth_edge_ratio: Optional[float] = None
+    selected_overlap_robot_geo_motion_ratio: Optional[float] = None
+    selected_overlap_robot_geo_near_ratio: Optional[float] = None
+    depth_edge_topk_overlap_with_robot_geo_topk: Optional[float] = None
+    robot_geo_topk_overlap_with_depth_edge_topk: Optional[float] = None
+    selected_high_depth_edge_but_low_robot_geo_count: Optional[int] = None
+    dropped_high_depth_edge_tokens_count: Optional[int] = None
+    dropped_high_robot_geo_tokens_count: Optional[int] = None
+    # Selected token spatial distribution (UV grid coordinates)
+    selected_token_u_mean: Optional[float] = None
+    selected_token_u_std: Optional[float] = None
+    selected_token_v_mean: Optional[float] = None
+    selected_token_v_std: Optional[float] = None
+    selected_token_bbox_u_min: Optional[int] = None
+    selected_token_bbox_u_max: Optional[int] = None
+    selected_token_bbox_v_min: Optional[int] = None
+    selected_token_bbox_v_max: Optional[int] = None
+    selected_token_grid_quadrant_histogram: Optional[str] = None
+    selected_token_near_gripper_pixel_dist_mean: Optional[float] = None
+    selected_token_near_gripper_pixel_dist_median: Optional[float] = None
+    # Workspace score diagnostics
+    workspace_score_min: Optional[float] = None
+    workspace_score_unique_count: Optional[int] = None
+    workspace_all_one: Optional[bool] = None
+    workspace_all_one_reason: Optional[str] = None
+    workspace_fallback_used: Optional[bool] = None
+    workspace_bounds: Optional[str] = None
+    workspace_valid_token_ratio: Optional[float] = None
+    # Score component unique counts (diagnostic for degeneracy)
+    near_score_unique_count: Optional[int] = None
+    depth_edge_score_unique_count: Optional[int] = None
+    motion_cone_score_unique_count: Optional[int] = None
+    final_score_unique_count: Optional[int] = None
+
+    # ---- P5: Edge reserve ablation diagnostics ----
+    edge_reserve_enabled: Optional[bool] = None
+    edge_reserve_ratio: Optional[float] = None
+    edge_reserved_target_count: Optional[int] = None
+    edge_reserved_actual_count: Optional[int] = None
+    edge_reserved_survival_ratio: Optional[float] = None
+    selected_by_edge_reserved_count: Optional[int] = None
+    selected_by_original_hybrid_count: Optional[int] = None
+    duplicate_edge_hybrid_count: Optional[int] = None
+    K_edge_reserve_target: Optional[int] = None
+    K_edge_reserve_actual: Optional[int] = None
+    # P5-fix: renamed duplicate metrics
+    duplicate_after_exclusion_count: Optional[int] = None
+    duplicate_with_original_hybrid_count: Optional[int] = None
+    # P5-fix: reserved / non-reserved split diagnostics
+    reserved_edge_topk_count: Optional[int] = None
+    reserved_edge_kept_count: Optional[int] = None
+    reserved_edge_dropped_count: Optional[int] = None
+    reserved_edge_topk_dropped_ratio: Optional[float] = None
+    non_reserved_edge_topk_count: Optional[int] = None
+    non_reserved_edge_kept_count: Optional[int] = None
+    non_reserved_edge_dropped_count: Optional[int] = None
+    non_reserved_edge_topk_dropped_ratio: Optional[float] = None
+    overall_depth_edge_topk_count: Optional[int] = None
+    overall_depth_edge_topk_kept_count: Optional[int] = None
+    overall_depth_edge_topk_dropped_count: Optional[int] = None
+    overall_depth_edge_topk_dropped_ratio: Optional[float] = None
+    # P5-fix: edge_reserve invalid flag and diagnostics
+    edge_reserve_invalid: Optional[bool] = None
+    edge_reserve_invalid_reason: Optional[str] = None
+    edge_scores_available: Optional[bool] = None
+    edge_scores_shape: Optional[int] = None
+    edge_scores_finite_ratio: Optional[float] = None
+    # P5-fix: accounting and invariant checks
+    edge_reserve_accounting_valid: Optional[bool] = None
+    edge_reserve_accounting_error: Optional[str] = None
+    edge_reserve_split_metrics_valid: Optional[bool] = None
+    diagnostic_k_small: Optional[int] = None
+    diagnostic_k_large: Optional[int] = None
+    no_duplicate_final_indices: Optional[bool] = None
+    final_indices_sorted: Optional[bool] = None
+    selected_token_count_equals_kept: Optional[bool] = None
+    retention_ratio_valid: Optional[bool] = None
+    # P5-fix: new phase-level attribution counts
+    selected_by_phase1_hybrid_count: Optional[int] = None
+    selected_by_phase2_diversity_count: Optional[int] = None
+    selected_by_phase3_fallback_count: Optional[int] = None
+    selected_by_unattributed_count: Optional[int] = None
+
+    # Stage X: Selection Path Integrity Audit diagnostics
+    requested_pruning_strategy: Optional[str] = None
+    effective_pruning_strategy: Optional[str] = None
+    selector_name: Optional[str] = None
+    selector_function_name: Optional[str] = None
+    selection_strategy_name: Optional[str] = None
+    selection_stage_name: Optional[str] = None
+    selector_success: Optional[bool] = None
+    selector_exception_type: Optional[str] = None
+    selector_exception_msg: Optional[str] = None
+    fallback_selector_name: Optional[str] = None
+    keep_indices_source: Optional[str] = None
+    keep_indices_count: Optional[int] = None
+    keep_indices_unique: Optional[bool] = None
+    keep_indices_out_of_bounds: Optional[bool] = None
+    actual_retention_ratio: Optional[float] = None
+    keep_ratio_requested: Optional[float] = None
+    keep_ratio_actual: Optional[float] = None
+    retention_actual: Optional[float] = None
+    selection_error: Optional[str] = None
+    selection_warning: Optional[str] = None
+    selected_by_phase1: Optional[int] = None
+    selected_by_phase2: Optional[int] = None
+    selected_by_phase3: Optional[int] = None
+    selected_by_fill: Optional[int] = None
+    selected_by_fallback: Optional[int] = None
+    selected_unattributed: Optional[int] = None
+    phase_accounting_sum: Optional[int] = None
+    phase_accounting_valid: Optional[bool] = None
+    phase_accounting_error: Optional[str] = None
+    reserved_edge_dropped_ratio: Optional[float] = None
+    non_reserved_topk_count: Optional[int] = None
+    non_reserved_kept_count: Optional[int] = None
+    non_reserved_dropped_count: Optional[int] = None
+    non_reserved_dropped_ratio: Optional[float] = None
+    total_keep_budget: Optional[int] = None
+    depth_edge_budget: Optional[int] = None
+    robot_geo_budget: Optional[int] = None
+    robot_contact_budget: Optional[int] = None
+    fill_budget: Optional[int] = None
+    safety_budget: Optional[int] = None
+    score_min: Optional[float] = None
+    score_max: Optional[float] = None
+    score_mean: Optional[float] = None
+    score_std: Optional[float] = None
+    # P7: hybrid_budget_v2 fields
+    hybrid_budget_v2: Optional[bool] = None
+    depth_edge_budget_ratio: Optional[float] = None
+    robot_contact_budget_ratio: Optional[float] = None
+    safety_budget_ratio: Optional[float] = None
+    K_depth_actual: Optional[int] = None
+    K_robot_actual: Optional[int] = None
+    K_fill_actual: Optional[int] = None
+    overlap_depth_robot_count: Optional[int] = None
+    overlap_depth_robot_diagnostic: Optional[int] = None
+    depth_edge_candidates_count: Optional[int] = None
+    robot_geo_candidates_count: Optional[int] = None
+    depth_edge_reserved_kept_count: Optional[int] = None
+    robot_geo_reserved_kept_count: Optional[int] = None
+    fill_from_depth_count: Optional[int] = None
+    fill_from_robot_count: Optional[int] = None
+    fill_from_other_count: Optional[int] = None
+    # P11: branch_budget_v0 fields
+    branch_budget_v0: Optional[bool] = None
+    branch_accounting_valid: Optional[bool] = None
+    branch_sum_equals_kept: Optional[bool] = None
+    selected_by_depth_branch_count: Optional[int] = None
+    selected_by_hybrid_branch_count: Optional[int] = None
+    selected_by_fill_branch_count: Optional[int] = None
+    overlap_depth_edge_hybrid_count: Optional[int] = None
+    overlap_depth_edge_hybrid_ratio: Optional[float] = None
+    non_reserved_depth_edge_dropped_ratio: Optional[float] = None
+    branch_budget_depth_ratio_override: Optional[float] = None
+    branch_budget_hybrid_ratio_override: Optional[float] = None
+    # P11.3: DE top-k attribution by branch
+    depth_edge_topk_kept_by_depth_branch_count: Optional[int] = None
+    depth_edge_topk_kept_by_hybrid_branch_count: Optional[int] = None
+    depth_edge_topk_kept_by_fill_branch_count: Optional[int] = None
+    depth_edge_topk_kept_by_fallback_count: Optional[int] = None
+    depth_edge_topk_survival_ratio: Optional[float] = None
+    # P11.3: Hybrid/final-score top-k attribution by branch
+    hybrid_final_score_topk_kept_by_depth_branch_count: Optional[int] = None
+    hybrid_final_score_topk_kept_by_hybrid_branch_count: Optional[int] = None
+    hybrid_final_score_topk_kept_by_fill_branch_count: Optional[int] = None
+    hybrid_final_score_topk_kept_by_fallback_count: Optional[int] = None
+    hybrid_final_score_topk_survival_ratio: Optional[float] = None
+    # P11.3: Legacy aliases for hybrid top-k (P8 compat)
+    hybrid_topk_kept_by_depth_branch_count: Optional[int] = None
+    hybrid_topk_kept_by_hybrid_branch_count: Optional[int] = None
+    hybrid_topk_kept_by_fill_branch_count: Optional[int] = None
+    hybrid_topk_kept_by_fallback_count: Optional[int] = None
+    hybrid_topk_survival_ratio: Optional[float] = None
+    # P14-B: Robot-self mask diagnostics
+    robot_self_mask_enabled: Optional[bool] = None
+    self_mask_available: Optional[bool] = None
+    self_mask_core_radius_px: Optional[float] = None
+    self_mask_token_count: Optional[int] = None
+    self_mask_token_ratio: Optional[float] = None
+    selected_self_mask_token_count: Optional[int] = None
+    selected_self_mask_token_ratio: Optional[float] = None
+    near_score_mean_before_self_mask: Optional[float] = None
+    near_score_mean_after_self_mask: Optional[float] = None
+    near_score_self_region_mean: Optional[float] = None
+    near_score_nonself_region_mean: Optional[float] = None
+    hybrid_score_mean_before_self_mask: Optional[float] = None
+    hybrid_score_mean_after_self_mask: Optional[float] = None
+    gripper_pixel_u: Optional[float] = None
+    gripper_pixel_v: Optional[float] = None
+    gripper_in_bounds: Optional[bool] = None
+    gripper_pixel_in_bounds: Optional[bool] = None
+    gripper_projection_valid: Optional[bool] = None
+
+    # P15: ACGTP-v1 strategy flag and branch weights
+    acgtp_v1: Optional[bool] = None
+    acgtp_w_scene_layout: Optional[float] = None
+    acgtp_w_depth_structure: Optional[float] = None
+    acgtp_w_contact_ring: Optional[float] = None
+    acgtp_w_motion_corridor: Optional[float] = None
+    # P15: Self-filtered contact ring
+    acgtp_self_core_radius_px: Optional[float] = None
+    acgtp_contact_ring_inner_px: Optional[float] = None
+    acgtp_contact_ring_outer_px: Optional[float] = None
+    acgtp_self_core_token_count: Optional[int] = None
+    acgtp_self_core_token_ratio: Optional[float] = None
+    acgtp_contact_ring_token_count: Optional[int] = None
+    acgtp_contact_ring_token_ratio: Optional[float] = None
+    acgtp_contact_ring_gated_token_count: Optional[int] = None
+    acgtp_contact_ring_valid: Optional[bool] = None
+    # P15: Scene layout branch
+    acgtp_scene_layout_score_mean: Optional[float] = None
+    acgtp_scene_layout_score_max: Optional[float] = None
+    acgtp_support_plane_token_count: Optional[int] = None
+    acgtp_object_component_token_count: Optional[int] = None
+    acgtp_boundary_token_count: Optional[int] = None
+    acgtp_scene_fill_candidate_count: Optional[int] = None
+    acgtp_scene_fill_candidate_ratio: Optional[float] = None
+    # P6: support_plane cap diagnostics
+    acgtp_support_plane_candidate_count: Optional[int] = None
+    acgtp_scene_support_plane_cap_ratio: Optional[float] = None
+    acgtp_scene_support_plane_cap_used: Optional[bool] = None
+    acgtp_scene_support_plane_fallback_used: Optional[bool] = None
+    acgtp_scene_support_plane_fallback_reason: Optional[str] = None
+    # P6: object_component fallback
+    acgtp_scene_object_component_fallback_used: Optional[bool] = None
+    acgtp_scene_object_component_fallback_reason: Optional[str] = None
+    acgtp_scene_object_component_num_components: Optional[int] = None
+    # P6: boundary fallback + source
+    acgtp_scene_boundary_fallback_used: Optional[bool] = None
+    acgtp_scene_boundary_fallback_reason: Optional[str] = None
+    acgtp_scene_boundary_from_object_count: Optional[int] = None
+    acgtp_scene_boundary_from_depth_count: Optional[int] = None
+    # P6: per-branch timing (ms)
+    acgtp_scene_layout_ms: Optional[float] = None
+    acgtp_contact_ring_ms: Optional[float] = None
+    acgtp_motion_corridor_ms: Optional[float] = None
+    # Scene layout per-component selected attribution (post-selection)
+    acgtp_scene_selected_support_plane_count: Optional[int] = None
+    acgtp_scene_selected_object_component_count: Optional[int] = None
+    acgtp_scene_selected_boundary_count: Optional[int] = None
+    acgtp_scene_selected_relation_count: Optional[int] = None
+    acgtp_scene_support_plane_selected_ratio: Optional[float] = None
+    # P15: Motion corridor
+    acgtp_motion_corridor_valid: Optional[bool] = None
+    acgtp_motion_corridor_score_mean: Optional[float] = None
+    acgtp_motion_corridor_score_max: Optional[float] = None
+    acgtp_motion_corridor_length_m: Optional[float] = None
+    acgtp_motion_norm_m: Optional[float] = None
+    acgtp_motion_ema_alpha: Optional[float] = None
+    # P15: Depth structure branch
+    acgtp_depth_structure_score_mean: Optional[float] = None
+    acgtp_depth_structure_score_max: Optional[float] = None
+    # P15: ACGTP-v1 mixture action-constraint score
+    acgtp_action_constraint_score_mean: Optional[float] = None
+    acgtp_action_constraint_score_max: Optional[float] = None
+    acgtp_action_constraint_source: Optional[str] = None
+    acgtp_future_action_constraint_enabled: Optional[bool] = None
+    acgtp_future_action_constraint_valid: Optional[bool] = None
+    acgtp_future_action_constraint_disabled_reason: Optional[str] = None
+    acgtp_future_action_constraint_score_mean: Optional[float] = None
+    acgtp_future_action_constraint_score_max: Optional[float] = None
+    acgtp_object_side_contact_score_mean: Optional[float] = None
+    acgtp_object_side_contact_score_max: Optional[float] = None
+    acgtp_swept_motion_risk_score_mean: Optional[float] = None
+    acgtp_swept_motion_risk_score_max: Optional[float] = None
+    acgtp_collision_contact_risk_score_mean: Optional[float] = None
+    acgtp_collision_contact_risk_score_max: Optional[float] = None
+    acgtp_contact_object_overlap_count: Optional[int] = None
+    acgtp_robot_self_penalty_count: Optional[int] = None
+    acgtp_action_constraint_ms: Optional[float] = None
+    acgtp_latency_plan_cache_enabled: Optional[bool] = None
+    acgtp_latency_plan_cache_hit: Optional[bool] = None
+    acgtp_latency_plan_cache_reason: Optional[str] = None
+    acgtp_latency_plan_cache_age: Optional[int] = None
+    acgtp_latency_plan_cache_depth_delta: Optional[float] = None
+    acgtp_latency_plan_cache_gripper_delta: Optional[float] = None
+    acgtp_latency_plan_cache_lookup_ms: Optional[float] = None
+    acgtp_latency_plan_cache_keep_count: Optional[int] = None
+    # Step 7: explicit branch-ablation probe.
+    acgtp_ablate_enabled: Optional[bool] = None
+    acgtp_ablate_branches: Optional[str] = None
+    acgtp_ablate_scene: Optional[bool] = None
+    acgtp_ablate_depth: Optional[bool] = None
+    acgtp_ablate_contact: Optional[bool] = None
+    acgtp_ablate_motion: Optional[bool] = None
+    acgtp_ablate_fill: Optional[bool] = None
+    # Step 6: ACGTP history stabilizer
+    acgtp_history_enabled: Optional[bool] = None
+    acgtp_history_length: Optional[int] = None
+    acgtp_history_capacity: Optional[int] = None
+    acgtp_history_length_after_update: Optional[int] = None
+    acgtp_history_warmup: Optional[bool] = None
+    acgtp_history_ema_available: Optional[bool] = None
+    acgtp_history_smoothing_applied: Optional[bool] = None
+    acgtp_history_conservative_mode: Optional[bool] = None
+    acgtp_history_conservative_reason: Optional[str] = None
+    acgtp_history_disabled_reason: Optional[str] = None
+    acgtp_history_depth_change: Optional[float] = None
+    acgtp_history_keep_mask_iou: Optional[float] = None
+    acgtp_history_motion_stability: Optional[float] = None
+    acgtp_history_depth_valid_ratio: Optional[float] = None
+    acgtp_history_scene_ema_alpha: Optional[float] = None
+    acgtp_history_depth_ema_alpha: Optional[float] = None
+    acgtp_history_contact_ema_alpha: Optional[float] = None
+    acgtp_history_motion_ema_alpha: Optional[float] = None
+    acgtp_history_action_ema_alpha: Optional[float] = None
+    acgtp_history_phase_switch: Optional[bool] = None
+    acgtp_history_force_conservative_next: Optional[bool] = None
+    acgtp_history_force_conservative_reason: Optional[str] = None
+    acgtp_history_keep_boost_applied: Optional[bool] = None
+    # Step 5: ACGTP dynamic phase/risk controller
+    acgtp_dynamic_enabled: Optional[bool] = None
+    acgtp_dynamic_phase: Optional[str] = None
+    acgtp_dynamic_candidate_phase: Optional[str] = None
+    acgtp_dynamic_previous_phase: Optional[str] = None
+    acgtp_dynamic_hysteresis_state: Optional[str] = None
+    acgtp_dynamic_risk: Optional[float] = None
+    acgtp_dynamic_confidence: Optional[float] = None
+    acgtp_dynamic_keep_ratio: Optional[float] = None
+    acgtp_dynamic_keep_k: Optional[int] = None
+    acgtp_dynamic_base_keep_ratio: Optional[float] = None
+    acgtp_dynamic_raw_keep_ratio: Optional[float] = None
+    acgtp_dynamic_phase_min_keep_ratio: Optional[float] = None
+    acgtp_dynamic_phase_max_keep_ratio: Optional[float] = None
+    acgtp_dynamic_lock_strength: Optional[float] = None
+    acgtp_dynamic_uncertainty_boost: Optional[float] = None
+    acgtp_dynamic_risk_boost: Optional[float] = None
+    acgtp_dynamic_prune_gain: Optional[float] = None
+    acgtp_dynamic_keep_reason: Optional[str] = None
+    acgtp_dynamic_phase_schedule: Optional[str] = None
+    acgtp_dynamic_branch_floor_enabled: Optional[bool] = None
+    acgtp_dynamic_min_scene_tokens: Optional[int] = None
+    acgtp_dynamic_min_depth_tokens: Optional[int] = None
+    acgtp_dynamic_min_contact_tokens: Optional[int] = None
+    acgtp_dynamic_min_motion_tokens: Optional[int] = None
+    acgtp_dynamic_fill_cap_ratio: Optional[float] = None
+    acgtp_dynamic_fill_cap_tokens: Optional[int] = None
+    acgtp_dynamic_layout_motion_alignment: Optional[float] = None
+    acgtp_dynamic_binary_alignment: Optional[float] = None
+    acgtp_dynamic_contact_phase_gate: Optional[str] = None
+    acgtp_dynamic_contact_peak: Optional[float] = None
+    acgtp_dynamic_contact_mean: Optional[float] = None
+    acgtp_dynamic_contact_ratio: Optional[float] = None
+    acgtp_dynamic_motion_peak: Optional[float] = None
+    acgtp_dynamic_motion_mean: Optional[float] = None
+    acgtp_dynamic_motion_ratio: Optional[float] = None
+    acgtp_dynamic_physical_ratio: Optional[float] = None
+    acgtp_dynamic_high_contact: Optional[bool] = None
+    acgtp_dynamic_high_contact_coverage: Optional[bool] = None
+    acgtp_dynamic_high_contact_legacy: Optional[bool] = None
+    acgtp_dynamic_shadow_contact_guard: Optional[bool] = None
+    acgtp_dynamic_high_motion: Optional[bool] = None
+    acgtp_dynamic_strong_layout: Optional[bool] = None
+    acgtp_dynamic_action_peak: Optional[float] = None
+    acgtp_dynamic_action_mean: Optional[float] = None
+    acgtp_dynamic_depth_valid_ratio: Optional[float] = None
+    acgtp_dynamic_fill_candidate_count: Optional[int] = None
+    acgtp_dynamic_fill_candidate_ratio: Optional[float] = None
+    acgtp_dynamic_candidate_gap_count: Optional[int] = None
+    acgtp_dynamic_candidate_gap_ratio: Optional[float] = None
+    acgtp_dynamic_candidate_clamped: Optional[bool] = None
+    acgtp_dynamic_scene_weight: Optional[float] = None
+    acgtp_dynamic_depth_weight: Optional[float] = None
+    acgtp_dynamic_contact_weight: Optional[float] = None
+    acgtp_dynamic_motion_weight: Optional[float] = None
+    acgtp_dynamic_hard_protect_ratio: Optional[float] = None
+    acgtp_dynamic_budget_vector: Optional[str] = None
+    acgtp_dynamic_disabled_reason: Optional[str] = None
+    # ACGTP-v2.1 selector policy diagnostics
+    acgtp_selector_version: Optional[str] = None
+    acgtp_quota_policy: Optional[str] = None
+    acgtp_fill_policy: Optional[str] = None
+    # P15: Hard protect selection
+    acgtp_hard_protect_count: Optional[int] = None
+    acgtp_hard_protect_ratio: Optional[float] = None
+    acgtp_hard_protect_valid: Optional[bool] = None
+    acgtp_scene_quota: Optional[int] = None
+    acgtp_depth_quota: Optional[int] = None
+    acgtp_contact_quota: Optional[int] = None
+    acgtp_motion_quota: Optional[int] = None
+    acgtp_scene_quota_weight: Optional[float] = None
+    acgtp_depth_quota_weight: Optional[float] = None
+    acgtp_contact_quota_weight: Optional[float] = None
+    acgtp_motion_quota_weight: Optional[float] = None
+    acgtp_min_scene_tokens: Optional[int] = None
+    acgtp_min_depth_tokens: Optional[int] = None
+    acgtp_min_contact_tokens: Optional[int] = None
+    acgtp_min_motion_tokens: Optional[int] = None
+    acgtp_scene_allocated: Optional[int] = None
+    acgtp_depth_allocated: Optional[int] = None
+    acgtp_contact_allocated: Optional[int] = None
+    acgtp_motion_allocated: Optional[int] = None
+    acgtp_coverage_fill_candidate_count: Optional[int] = None
+    acgtp_coverage_fill_candidate_ratio: Optional[float] = None
+    acgtp_constrained_fill_cap_tokens: Optional[int] = None
+    acgtp_constrained_fill_cap_applied: Optional[bool] = None
+    # P15: Selection attribution counts
+    selected_by_scene_layout_count: Optional[int] = None
+    selected_by_depth_structure_count: Optional[int] = None
+    selected_by_contact_ring_count: Optional[int] = None
+    selected_by_motion_corridor_count: Optional[int] = None
+    selected_by_constrained_fill_count: Optional[int] = None
+    selected_by_acgtp_fallback_count: Optional[int] = None
+    # P15: Overlap counts
+    overlap_scene_depth_count: Optional[int] = None
+    overlap_scene_contact_count: Optional[int] = None
+    overlap_contact_motion_count: Optional[int] = None
+    overlap_scene_motion_count: Optional[int] = None
+    overlap_depth_contact_count: Optional[int] = None
+    overlap_depth_motion_count: Optional[int] = None
+    # P15: Accounting validation
+    acgtp_branch_accounting_valid: Optional[bool] = None
+    acgtp_branch_sum: Optional[int] = None
+    acgtp_branch_sum_error: Optional[int] = None
+    acgtp_hard_protect_ratio_config: Optional[float] = None
+    acgtp_fallback_used: Optional[bool] = None
+    acgtp_fallback_reason: Optional[str] = None
+    acgtp_motion_disabled_reason: Optional[str] = None
+    # P15: Final selection stats
+    acgtp_final_kept: Optional[int] = None
+    acgtp_expected_kept: Optional[int] = None
+    acgtp_actual_keep_ratio: Optional[float] = None
+
+    # P16: ACGTP-v2 — Task-Semantic Anchor Branch
+    acgtp_v2: Optional[bool] = None
+    acgtp_v2_semantic_enabled: Optional[bool] = None
+    acgtp_v2_semantic_backend: Optional[str] = None
+    acgtp_v2_semantic_confidence: Optional[float] = None
+    acgtp_v2_semantic_unavailable: Optional[bool] = None
+    acgtp_v2_semantic_fallback_reason: Optional[str] = None
+    acgtp_v2_release_quota: Optional[bool] = None
+    acgtp_v2_parsed_instruction_meaningful: Optional[bool] = None
+    acgtp_v2_parsed_target_terms: Optional[str] = None
+    acgtp_v2_parsed_reference_terms: Optional[str] = None
+    acgtp_v2_parsed_relation_terms: Optional[str] = None
+    acgtp_v2_w_semantic_target: Optional[float] = None
+    acgtp_v2_w_semantic_reference: Optional[float] = None
+    acgtp_v2_w_semantic_relation: Optional[float] = None
+    acgtp_v2_w_semantic_goal: Optional[float] = None
+    acgtp_v2_semantic_target_token_count: Optional[int] = None
+    acgtp_v2_semantic_target_kept_count: Optional[int] = None
+    acgtp_v2_semantic_target_kept_ratio: Optional[float] = None
+    acgtp_v2_semantic_reference_token_count: Optional[int] = None
+    acgtp_v2_semantic_reference_kept_count: Optional[int] = None
+    acgtp_v2_semantic_reference_kept_ratio: Optional[float] = None
+    acgtp_v2_semantic_relation_token_count: Optional[int] = None
+    acgtp_v2_semantic_relation_kept_count: Optional[int] = None
+    acgtp_v2_semantic_relation_kept_ratio: Optional[float] = None
+    acgtp_v2_semantic_goal_token_count: Optional[int] = None
+    acgtp_v2_semantic_goal_kept_count: Optional[int] = None
+    acgtp_v2_semantic_goal_kept_ratio: Optional[float] = None
+    acgtp_v2_semantic_anchor_token_count: Optional[int] = None
+    selected_by_semantic_target_count: Optional[int] = None
+    selected_by_semantic_reference_count: Optional[int] = None
+    selected_by_semantic_relation_count: Optional[int] = None
+    selected_by_semantic_goal_count: Optional[int] = None
+    selected_by_scene_residual_fill_count: Optional[int] = None
+    semantic_overlap_with_scene_count: Optional[int] = None
+    semantic_overlap_with_depth_count: Optional[int] = None
+    semantic_overlap_with_contact_count: Optional[int] = None
+    semantic_overlap_with_motion_count: Optional[int] = None
+    acgtp_v2_hard_semantic_quota: Optional[int] = None
+    acgtp_v2_target_cap_k: Optional[int] = None
+    acgtp_v2_reference_cap_k: Optional[int] = None
+    acgtp_v2_relation_cap_k: Optional[int] = None
+    acgtp_scene_selected_residual_fill_count: Optional[int] = None
+    acgtp_scene_residual_fill_token_count: Optional[int] = None
+    acgtp_scene_residual_fill_token_count_computed: Optional[bool] = None
+    selected_by_semantic_count: Optional[int] = None
+
+    # P16: ACGTP-v2 — strict fallback dispatch fields
+    strict_fallback_dispatch_used: Optional[bool] = None
+    delegated_selector_name: Optional[str] = None
+    fallback_dispatch_to_v1: Optional[bool] = None
+    # P16: Semantic state
+    semantic_backend: Optional[str] = None
+    semantic_unavailable: Optional[bool] = None
+    semantic_confidence: Optional[float] = None
+    semantic_available: Optional[bool] = None
+    semantic_quota_released: Optional[bool] = None
+    # P16: Attention state
+    attention_backend: Optional[str] = None
+    attention_source: Optional[str] = None
+    attention_available: Optional[bool] = None
+    attention_confidence: Optional[float] = None
+    attention_quota_released: Optional[bool] = None
+    selected_by_attention_count: Optional[int] = None
+    attention_only_token_count: Optional[int] = None
+    attention_selected_by_final_count: Optional[int] = None
+    attention_top_count: Optional[int] = None
+    # P16: Safe-drop diagnostics
+    safe_drop_candidate_count: Optional[int] = None
+    high_attention_low_geometry_count: Optional[int] = None
+    high_geometry_low_attention_count: Optional[int] = None
+    # VLA-Pruner-style post-pruning sequence handling
+    position_preserve_enabled: Optional[bool] = None
+    position_preserve_applied: Optional[bool] = None
+    position_preserve_reason: Optional[str] = None
+    position_preserve_original_visual_tokens: Optional[int] = None
+    position_preserve_kept_visual_tokens: Optional[int] = None
+    position_preserve_text_tokens: Optional[int] = None
+    position_preserve_prefill_seq_len: Optional[int] = None
+    position_preserve_original_seq_len: Optional[int] = None
+    position_preserve_max_position_id: Optional[int] = None
+    position_preserve_decode_tokens: Optional[int] = None
+    pruning_info_recorded: Optional[bool] = None
+    pruning_info_kept_indices_count: Optional[int] = None
+    pruning_info_pruned_indices_count: Optional[int] = None
+    compression_backend: Optional[str] = None
+    projector_pruning_applied: Optional[bool] = None
+    internal_pruning_requested: Optional[bool] = None
+    internal_pruning_plan_ready: Optional[bool] = None
+    internal_pruning_applied: Optional[bool] = None
+    internal_pruning_layer: Optional[int] = None
+    internal_pruning_disabled_reason: Optional[str] = None
+    internal_backend_error: Optional[str] = None
+    internal_original_seq_length: Optional[int] = None
+    internal_kept_seq_length: Optional[int] = None
+    internal_pruned_seq_length: Optional[int] = None
+    internal_original_visual_tokens: Optional[int] = None
+    internal_kept_visual_tokens: Optional[int] = None
+    internal_pruned_visual_tokens: Optional[int] = None
+    visual_tokens_at_llm_entry: Optional[int] = None
+    visual_tokens_after_internal_prune: Optional[int] = None
+    internal_trace_enabled: Optional[bool] = None
+    internal_total_layers: Optional[int] = None
+    internal_first_short_layer: Optional[int] = None
+    internal_full_length_layer_count: Optional[int] = None
+    internal_shortened_layer_count: Optional[int] = None
+    internal_post_prune_layer_count: Optional[int] = None
+    internal_post_prune_layer_ratio: Optional[float] = None
+    prefill_seq_len_before_layer: Optional[Any] = None
+    prefill_seq_len_after_layer: Optional[Any] = None
+    prefill_kv_cache_seq_len_by_layer: Optional[Any] = None
+    internal_kv_cache_full_length_layer_count: Optional[int] = None
+    internal_kv_cache_short_length_layer_count: Optional[int] = None
+    internal_kv_cache_token_reduction_ratio: Optional[float] = None
+    internal_kv_cache_mean_seq_len: Optional[float] = None
+    internal_decode_calls: Optional[int] = None
+    internal_decode_bookkeeping_ms: Optional[float] = None
+    last_decode_bookkeeping_ms: Optional[float] = None
+    internal_decode_cache_consistent: Optional[bool] = None
+    internal_decode_cache_consistent_by_layer: Optional[bool] = None
+    decode_cache_scalar_omitted_for_latency: Optional[bool] = None
+    decode_cache_by_layer_omitted_for_latency: Optional[bool] = None
+    decode_cache_seq_len_before_by_layer: Optional[Any] = None
+    decode_cache_seq_len_after_by_layer: Optional[Any] = None
+    decode_effective_kv_tokens_mean: Optional[float] = None
+    decode_short_cache_layer_count: Optional[int] = None
+    decode_pruned_cache_layer_count: Optional[int] = None
+    internal_decode_attention_capture_requested: Optional[bool] = None
+    internal_decode_attention_capture_enabled: Optional[bool] = None
+    internal_decode_attention_capture_disabled_for_latency: Optional[bool] = None
+    internal_selection_mode: Optional[str] = None
+    internal_attention_enabled: Optional[bool] = None
+    internal_attention_available: Optional[bool] = None
+    internal_attention_source: Optional[str] = None
+    internal_attention_confidence: Optional[float] = None
+    internal_historical_action_attention_available: Optional[bool] = None
+    internal_historical_action_attention_source: Optional[str] = None
+    internal_geo_attention_iou: Optional[float] = None
+    internal_high_geometry_low_attention_count: Optional[int] = None
+    internal_high_attention_low_geometry_count: Optional[int] = None
+    internal_attention_dropped_geo_count: Optional[int] = None
+    internal_pruned_geo_critical_count: Optional[int] = None
+    internal_geo_protected_count: Optional[int] = None
+    internal_geo_explicit_protected_count: Optional[int] = None
+    internal_geo_explicit_protected_kept_count: Optional[int] = None
+    internal_budget_raised_for_geo_protection: Optional[bool] = None
+    internal_dynamic_risk: Optional[float] = None
+    internal_dynamic_risk_level: Optional[str] = None
+    internal_dynamic_keep_ratio: Optional[float] = None
+    internal_dynamic_keep_k: Optional[int] = None
+    internal_quota_hard_k: Optional[int] = None
+    internal_quota_semantic_attention_k: Optional[int] = None
+    internal_quota_historical_attention_k: Optional[int] = None
+    internal_functional_quota_enabled: Optional[bool] = None
+    internal_quota_layout_k: Optional[int] = None
+    internal_quota_contact_k: Optional[int] = None
+    internal_quota_motion_k: Optional[int] = None
+    internal_quota_fill_k: Optional[int] = None
+    internal_selected_by_geo_count: Optional[int] = None
+    internal_selected_by_layout_count: Optional[int] = None
+    internal_selected_by_contact_count: Optional[int] = None
+    internal_selected_by_motion_count: Optional[int] = None
+    internal_selected_by_semantic_attention_count: Optional[int] = None
+    internal_selected_by_historical_attention_count: Optional[int] = None
+    internal_selected_by_fill_count: Optional[int] = None
+    internal_selected_by_fallback_count: Optional[int] = None
+    internal_unique_geo_count: Optional[int] = None
+    internal_unique_layout_count: Optional[int] = None
+    internal_unique_contact_count: Optional[int] = None
+    internal_unique_motion_count: Optional[int] = None
+    internal_unique_semantic_attention_count: Optional[int] = None
+    internal_unique_historical_attention_count: Optional[int] = None
+    internal_unique_fill_count: Optional[int] = None
+    internal_unique_fallback_count: Optional[int] = None
+    internal_branch_selected_sum: Optional[int] = None
+    internal_branch_unique_sum: Optional[int] = None
+    internal_branch_overlap_count: Optional[int] = None
+    internal_branch_overlap_ratio: Optional[float] = None
+    internal_branch_unique_ratio: Optional[float] = None
+    internal_branch_sum_equals_kept: Optional[bool] = None
+    internal_branch_accounting_valid: Optional[bool] = None
+    internal_fallback_added_count: Optional[int] = None
+    internal_attention_requires_geometry_alignment: Optional[bool] = None
+
+# ----------------------------------------------------------------------
+# Episode-level metrics
+# ----------------------------------------------------------------------
+@dataclass
+class EpisodeMetrics:
+    """Per-episode metrics record."""
+
+    # Identity
+    task_name: str = ""
+    task_id: int = 0
+    episode_id: int = 0
+    trial_idx: int = 0
+    seed: int = 7
+    initial_state_index: Optional[int] = None
+    initial_state_hash: Optional[str] = None
+    strict_pairing_key: Optional[str] = None
+
+    # Outcome
+    success: bool = False
+    timeout: bool = False
+    failure_reason: str = FailureReason.UNKNOWN
+
+    # Step counts
+    num_steps: int = 0                      # Total env steps (including settling)
+    num_inference_steps: int = 0          # Steps with model inference
+    num_settling_steps: int = 0           # Steps with no-op actions
+    max_steps: int = 0                    # Configured max steps for this task suite
+
+    # Timing
+    episode_time_sec: float = 0.0
+
+    # Per-step averages (computed over inference steps only)
+    mean_step_wall_time_ms: float = 0.0
+    std_step_wall_time_ms: Optional[float] = None
+    mean_preprocess_time_ms: Optional[float] = None
+    mean_model_forward_time_ms: float = 0.0
+    std_model_forward_time_ms: Optional[float] = None
+    mean_action_postprocess_time_ms: Optional[float] = None
+
+    # CUDA latency (torch.cuda.Event, GPU-only core inference)
+    mean_cuda_latency_ms: Optional[float] = None
+    std_cuda_latency_ms: Optional[float] = None
+
+    # Per-episode frequencies (computed from mean timings)
+    control_frequency_hz: Optional[float] = None
+    model_only_frequency_hz: Optional[float] = None
+    cuda_only_frequency_hz: Optional[float] = None
+
+    # Token ratios (derived: baseline = 1.0 / 0.0)
+    token_retention_ratio: Optional[float] = None
+    token_pruning_ratio: Optional[float] = None
+    effective_retention: Optional[float] = None
+    projector_retention: Optional[float] = None
+    internal_retention: Optional[float] = None
+    effective_visual_tokens_for_llm: Optional[int] = None
+    original_visual_tokens: Optional[int] = None
+    kept_visual_tokens: Optional[int] = None
+    pruned_visual_tokens: Optional[int] = None
+    llm_input_seq_len_before_prune: Optional[int] = None
+    llm_input_seq_len_after_prune: Optional[int] = None
+    llm_input_seq_len_pruned: Optional[int] = None
+
+    # Sub-module timing (each step's individual values, then averaged)
+    # Use null if the underlying model doesn't expose these timings
+    mean_vision_encoder_time_ms: Optional[float] = None
+    mean_projector_time_ms: Optional[float] = None
+    mean_llm_forward_time_ms: Optional[float] = None
+    mean_llm_prefill_time_ms: Optional[float] = None
+    mean_llm_decode_time_ms: Optional[float] = None
+    mean_llm_prefill_seq_len: Optional[float] = None
+    llm_timing_split_available: Optional[bool] = None
+    mean_action_decode_time_ms: Optional[float] = None
+    decode_impl: Optional[str] = None
+    decode_runtime_opt: Optional[str] = None
+    decode_runtime_opt_effective: Optional[str] = None
+    decode_runtime_opt_status: Optional[str] = None
+    fixed_shape_decode_enabled: Optional[bool] = None
+    fixed_shape_decode_effective: Optional[bool] = None
+    fixed_shape_decode_fallback_reason: Optional[str] = None
+    fixed_shape_cache_preallocated: Optional[bool] = None
+    fixed_shape_cache_max_len: Optional[int] = None
+    fixed_shape_cache_num_layers: Optional[int] = None
+    fixed_shape_cache_layout: Optional[str] = None
+    fixed_shape_decode_shape_stable: Optional[bool] = None
+    fixed_shape_decode_used_flash_attn_kvcache: Optional[bool] = None
+    decode_cuda_graph_capture_attempted: Optional[bool] = None
+    decode_cuda_graph_capture_success: Optional[bool] = None
+    decode_cuda_graph_fallback_reason: Optional[str] = None
+    runtime_opt_fallback_reason: Optional[str] = None
+    mean_hf_generate_total_ms: Optional[float] = None
+    mean_prefill_forward_ms: Optional[float] = None
+    mean_decode_loop_total_ms: Optional[float] = None
+    mean_decode_num_tokens: Optional[float] = None
+    mean_decode_per_token_ms: Optional[float] = None
+    mean_decode_model_forward_ms: Optional[float] = None
+    mean_decode_logits_head_ms: Optional[float] = None
+    mean_decode_postprocess_ms: Optional[float] = None
+    mean_action_token_cpu_transfer_ms: Optional[float] = None
+    mean_decode_compile_setup_ms: Optional[float] = None
+    mean_decode_python_overhead_ms: Optional[float] = None
+    mean_cuda_sync_count: Optional[float] = None
+    mean_implicit_cuda_sync_count: Optional[float] = None
+    decode_timing_scope: Optional[str] = None
+    decode_correctness_check_enabled: Optional[bool] = None
+    decode_correctness_check_passed: Optional[bool] = None
+    decode_latency_valid_for_clean_benchmark: Optional[bool] = None
+    transformers_version: Optional[str] = None
+    tokenizers_version: Optional[str] = None
+    torch_version: Optional[str] = None
+    cuda_version: Optional[str] = None
+    runtime_opt_mode: Optional[str] = None
+    pruning_enabled: Optional[bool] = None
+    prune_layer: Optional[int] = None
+
+    # GPU memory
+    max_gpu_memory_mb: float = 0.0
+    max_gpu_memory_reserved_mb: float = 0.0
+
+    # Token pruning fields (null for baseline)
+    num_visual_tokens_original: Optional[int] = None
+    num_visual_tokens_kept: Optional[int] = None
+    num_visual_tokens_pruned: Optional[int] = None
+    num_visual_tokens_per_encoder: Optional[Dict[str, int]] = None
+    num_processor_visual_tokens_estimated: Optional[int] = None
+    num_processor_visual_tokens_per_encoder: Optional[Dict[str, int]] = None
+    num_projector_visual_tokens_original: Optional[int] = None
+    num_projector_visual_tokens_kept: Optional[int] = None
+    num_projector_visual_tokens_pruned: Optional[int] = None
+    num_llm_visual_tokens: Optional[int] = None
+    geometry_expert_time_ms: Optional[float] = None
+    token_scoring_time_ms: Optional[float] = None
+    mask_apply_time_ms: Optional[float] = None
+    pruning_overhead_time_ms: Optional[float] = None
+    effective_model_forward_time_ms: Optional[float] = None
+    pruning_method: str = "none"
+    keep_ratio: float = 1.0
+
+    # Geometry scoring fields (null if geometry not enabled)
+    token_mapping_time_ms: Optional[float] = None
+    geometry_score_time_ms: Optional[float] = None
+    pruning_time_ms: Optional[float] = None
+    depth_fetch_ms: Optional[float] = None
+    depth_sample_ms: Optional[float] = None
+    depth_edge_score_ms: Optional[float] = None
+    token_xyz_projection_ms: Optional[float] = None
+    score_fusion_ms: Optional[float] = None
+    depth_sampling_ms: Optional[float] = None
+    score_compute_ms: Optional[float] = None
+    selection_ms: Optional[float] = None
+    gather_ms: Optional[float] = None
+    topk_pruning_ms: Optional[float] = None
+    keep_indices_sorted: Optional[bool] = None
+    duplicate_indices_count: Optional[int] = None
+    fallback_used: Optional[bool] = None
+    fallback_reason: Optional[str] = None
+    model_forward_ms: Optional[float] = None
+    end_to_end_step_wall_time_ms: Optional[float] = None
+    geometry_total_time_ms: Optional[float] = None
+    visualization_time_ms: Optional[float] = None
+    hook_total_time_ms: Optional[float] = None
+    hook_total_ms: Optional[float] = None
+
+    # Score statistics (null if geometry not enabled)
+    geometry_score_mean: Optional[float] = None
+    geometry_score_max: Optional[float] = None
+    geometry_score_std: Optional[float] = None
+    distance_score_mean: Optional[float] = None
+    direction_score_mean: Optional[float] = None
+    depth_edge_score_mean: Optional[float] = None
+    valid_token_ratio_mean: Optional[float] = None
+    geometry_available: Optional[bool] = None
+    robot_state_available: Optional[bool] = None
+    camera_available: Optional[bool] = None
+    d_min: Optional[float] = None
+    d_mean_topk: Optional[float] = None
+    mean_near_score: Optional[float] = None
+    max_near_score: Optional[float] = None
+    motion_norm: Optional[float] = None
+    corridor_strength_mean: Optional[float] = None
+    corridor_strength_topk_mean: Optional[float] = None
+    corridor_active: Optional[bool] = None
+    d_corridor_min: Optional[float] = None
+    d_corridor_mean_topk: Optional[float] = None
+    dynamic_enabled: Optional[bool] = None
+    dynamic_phase: Optional[str] = None
+    dynamic_keep_ratio: Optional[float] = None
+    geo_risk_level: Optional[str] = None
+    geo_risk_score: Optional[float] = None
+    dynamic_keep_reason: Optional[str] = None
+    num_high_contact_tokens: Optional[int] = None
+    num_valid_3d_tokens: Optional[int] = None
+    dynamic_keep_k: Optional[int] = None
+    d_topk_mean: Optional[float] = None
+    corridor_strength: Optional[float] = None
+    edge_concentration: Optional[float] = None
+    valid_depth_ratio: Optional[float] = None
+    phase_far_count: Optional[int] = None
+    phase_mid_count: Optional[int] = None
+    phase_near_count: Optional[int] = None
+    phase_fallback_safe_count: Optional[int] = None
+    mean_keep_ratio: Optional[float] = None
+    mean_keep_k: Optional[float] = None
+    phase_ratio_far: Optional[float] = None
+    phase_ratio_mid: Optional[float] = None
+    phase_ratio_near: Optional[float] = None
+    phase_ratio_fallback_safe: Optional[float] = None
+    interaction_lock: Optional[bool] = None
+    temporal_stability: Optional[float] = None
+    history_length: Optional[int] = None
+    score_ema_enabled: Optional[bool] = None
+    mean_K_edge_actual: Optional[float] = None
+    # Hybrid v1 / temporal episode-level aggregates
+    hybrid_score_mean: Optional[float] = None
+    hybrid_score_max: Optional[float] = None
+    hybrid_score_std: Optional[float] = None
+    actual_keep_ratio: Optional[float] = None
+    ema_used_for_selection: Optional[bool] = None
+    mean_K_geo_actual: Optional[float] = None
+    mean_K_diverse_actual: Optional[float] = None
+    mean_geo_contact_score_topk: Optional[float] = None
+    mean_near_contact_score_topk: Optional[float] = None
+    mean_corridor_contact_score_topk: Optional[float] = None
+
+    # P7: hybrid_budget_v2 episode aggregates
+    hybrid_budget_v2_ratio: Optional[float] = None
+    mean_depth_edge_budget_ratio: Optional[float] = None
+    mean_robot_contact_budget_ratio: Optional[float] = None
+    mean_safety_budget_ratio: Optional[float] = None
+    mean_K_depth_actual: Optional[float] = None
+    mean_K_robot_actual: Optional[float] = None
+    mean_K_fill_actual: Optional[float] = None
+    mean_overlap_depth_robot_count: Optional[float] = None
+    mean_depth_edge_candidates_count: Optional[float] = None
+    mean_robot_geo_candidates_count: Optional[float] = None
+    mean_fill_from_depth_count: Optional[float] = None
+    mean_fill_from_robot_count: Optional[float] = None
+    mean_fill_from_other_count: Optional[float] = None
+
+    # New diagnostic rollup fields
+    interaction_lock_ratio: Optional[float] = None
+    contact_risk_lock_ratio: Optional[float] = None
+    gripper_proximity_lock_ratio: Optional[float] = None
+    region_stability_lock_ratio: Optional[float] = None
+    valid_3d_token_ratio: Optional[float] = None
+    fallback_ratio: Optional[float] = None
+    action_has_nan_ratio: Optional[float] = None
+    action_has_inf_ratio: Optional[float] = None
+    action_min: Optional[float] = None
+    action_max: Optional[float] = None
+    action_mean: Optional[float] = None
+    action_std: Optional[float] = None
+    depth_valid_ratio: Optional[float] = None
+    distance_to_gripper_min: Optional[float] = None
+    distance_to_gripper_mean: Optional[float] = None
+    distance_to_gripper_max: Optional[float] = None
+    robot_state_valid_ratio: Optional[float] = None
+    motion_direction_valid_ratio: Optional[float] = None
+
+    # Action smoothness aggregates
+    mean_delta_action: float = 0.0
+    max_delta_action: float = 0.0
+    mean_jerk_action: float = 0.0
+    max_jerk_action: float = 0.0
+    gripper_change_count: int = 0
+
+    # Per-step lists (for per-episode JSONL only, not stored long-term)
+    _step_wall_times_ms: List[float] = field(default_factory=list, repr=False)
+    _model_forward_times_ms: List[float] = field(default_factory=list, repr=False)
+
+    # Configuration snapshot
+    task_suite: str = ""
+    model_path: str = ""
+
+
+# ----------------------------------------------------------------------
+# Metrics logger
+# ----------------------------------------------------------------------
+class MetricsLogger:
+    """
+    Collects and persists evaluation metrics with full action smoothness tracking
+    and success/failure split statistics.
+
+    Usage:
+        logger = MetricsLogger(save_dir="outputs/eval", log_step_metrics=True)
+        logger.log_episode(EpisodeMetrics(...))
+        logger.log_step(StepMetrics(...))
+        summary = logger.save_summary()
+    """
+
+    def __init__(
+        self,
+        save_dir: str = "outputs/openvla_eval",
+        log_step_metrics: bool = False,
+        config_dict: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.save_dir = Path(save_dir)
+        self.log_step_metrics = log_step_metrics
+        self.config_dict = config_dict or {}
+
+        self._episode_records: List[Dict[str, Any]] = []
+        self._step_records: List[Dict[str, Any]] = []
+
+        # Step-level accumulators for per-task step-level std computation
+        self._task_step_wall_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_fw_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_cuda_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_preprocess_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_postprocess_times: Dict[str, List[float]] = defaultdict(list)
+        # Step-level delta/jerk for per-task step-level max (Fix 3)
+        self._task_delta_actions: Dict[str, List[float]] = defaultdict(list)
+        self._task_jerk_actions: Dict[str, List[float]] = defaultdict(list)
+
+        # Geometry scoring accumulators (null if geometry not enabled)
+        self._task_token_mapping_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_geometry_score_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_pruning_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_fetch_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_sample_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_edge_score_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_token_xyz_projection_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_score_fusion_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_sampling_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_score_compute_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_selection_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_gather_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_edge_score_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_robot_mapping_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_near_score_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_corridor_score_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_contact_score_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_edge_selection_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_geo_selection_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_diverse_selection_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_final_merge_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_topk_pruning_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_hook_total_times: Dict[str, List[float]] = defaultdict(list)
+        self._task_hook_total_times_excluding_warmup: Dict[str, List[float]] = defaultdict(list)
+        self._task_geometry_total_times: Dict[str, List[float]] = defaultdict(list)
+
+        # Geometry score statistics accumulators
+        self._task_geometry_score_means: Dict[str, List[float]] = defaultdict(list)
+        self._task_geometry_score_maxes: Dict[str, List[float]] = defaultdict(list)
+        self._task_geometry_score_stds: Dict[str, List[float]] = defaultdict(list)
+        self._task_distance_score_means: Dict[str, List[float]] = defaultdict(list)
+        self._task_direction_score_means: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_edge_score_means: Dict[str, List[float]] = defaultdict(list)
+        self._task_valid_token_ratios: Dict[str, List[float]] = defaultdict(list)
+        self._task_d_mins: Dict[str, List[float]] = defaultdict(list)
+        self._task_d_mean_topks: Dict[str, List[float]] = defaultdict(list)
+        self._task_mean_near_scores: Dict[str, List[float]] = defaultdict(list)
+        self._task_max_near_scores: Dict[str, List[float]] = defaultdict(list)
+        self._task_motion_norms: Dict[str, List[float]] = defaultdict(list)
+        self._task_corridor_strength_means: Dict[str, List[float]] = defaultdict(list)
+        self._task_corridor_strength_topk_means: Dict[str, List[float]] = defaultdict(list)
+        self._task_d_corridor_mins: Dict[str, List[float]] = defaultdict(list)
+        self._task_d_corridor_mean_topks: Dict[str, List[float]] = defaultdict(list)
+        self._task_dynamic_keep_ratios: Dict[str, List[float]] = defaultdict(list)
+        self._task_dynamic_keep_ks: Dict[str, List[float]] = defaultdict(list)
+        self._task_d_topk_means: Dict[str, List[float]] = defaultdict(list)
+        self._task_corridor_strengths: Dict[str, List[float]] = defaultdict(list)
+        self._task_edge_concentrations: Dict[str, List[float]] = defaultdict(list)
+        self._task_valid_depth_ratios: Dict[str, List[float]] = defaultdict(list)
+        self._task_phase_counts: Dict[str, Counter] = defaultdict(Counter)
+        self._task_K_edge_actuals: Dict[str, List[float]] = defaultdict(list)
+        self._task_K_geo_actuals: Dict[str, List[float]] = defaultdict(list)
+        self._task_K_diverse_actuals: Dict[str, List[float]] = defaultdict(list)
+        self._task_geo_contact_score_topks: Dict[str, List[float]] = defaultdict(list)
+        self._task_near_contact_score_topks: Dict[str, List[float]] = defaultdict(list)
+        self._task_corridor_contact_score_topks: Dict[str, List[float]] = defaultdict(list)
+
+        # Visual token accumulators
+        self._task_vt_original: Dict[str, List[int]] = defaultdict(list)
+        self._task_vt_kept: Dict[str, List[int]] = defaultdict(list)
+
+        # New diagnostic accumulators
+        self._task_action_has_nan: Dict[str, List[bool]] = defaultdict(list)
+        self._task_action_has_inf: Dict[str, List[bool]] = defaultdict(list)
+        self._task_action_min: Dict[str, List[float]] = defaultdict(list)
+        self._task_action_max: Dict[str, List[float]] = defaultdict(list)
+        self._task_action_mean: Dict[str, List[float]] = defaultdict(list)
+        self._task_action_std: Dict[str, List[float]] = defaultdict(list)
+        self._task_contact_risk_lock: Dict[str, List[bool]] = defaultdict(list)
+        self._task_gripper_proximity_lock: Dict[str, List[bool]] = defaultdict(list)
+        self._task_region_stability_lock: Dict[str, List[bool]] = defaultdict(list)
+        self._task_depth_valid_ratio: Dict[str, List[float]] = defaultdict(list)
+        self._task_robot_state_valid: Dict[str, List[bool]] = defaultdict(list)
+        self._task_motion_direction_valid: Dict[str, List[bool]] = defaultdict(list)
+        self._task_dist_gripper_min: Dict[str, List[float]] = defaultdict(list)
+        self._task_dist_gripper_mean: Dict[str, List[float]] = defaultdict(list)
+        self._task_dist_gripper_max: Dict[str, List[float]] = defaultdict(list)
+        # P0: Depth conversion metadata accumulators
+        self._task_depth_source_key: Dict[str, List[str]] = defaultdict(list)
+        self._task_depth_conversion: Dict[str, List[str]] = defaultdict(list)
+        self._task_depth_is_metric: Dict[str, List[bool]] = defaultdict(list)
+        self._task_depth_unit: Dict[str, List[str]] = defaultdict(list)
+        self._task_depth_sim_available: Dict[str, List[bool]] = defaultdict(list)
+        self._task_depth_raw_min: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_raw_max: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_raw_mean: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_raw_std: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_metric_min: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_metric_max: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_metric_mean: Dict[str, List[float]] = defaultdict(list)
+        self._task_depth_metric_std: Dict[str, List[float]] = defaultdict(list)
+        # Transform convention fields (P0-4: T_robot_cam_forward)
+        self._task_transform_convention: Dict[str, List[str]] = defaultdict(list)
+        self._task_transform_inverse_used: Dict[str, List[bool]] = defaultdict(list)
+        self._task_transform_source: Dict[str, List[str]] = defaultdict(list)
+        self._task_transform_verified: Dict[str, List[bool]] = defaultdict(list)
+        self._task_transform_evidence: Dict[str, List[str]] = defaultdict(list)
+
+        self._overall_max_gpu_memory_mb: float = 0.0
+        self._overall_max_gpu_memory_reserved_mb: float = 0.0
+
+    def log_episode(self, episode: EpisodeMetrics) -> None:
+        """Log a single episode's metrics."""
+        record = asdict(episode)
+        # Remove internal lists before storing
+        record.pop("_step_wall_times_ms", None)
+        record.pop("_model_forward_times_ms", None)
+        self._episode_records.append(record)
+
+        if episode.max_gpu_memory_mb > self._overall_max_gpu_memory_mb:
+            self._overall_max_gpu_memory_mb = episode.max_gpu_memory_mb
+        if episode.max_gpu_memory_reserved_mb > self._overall_max_gpu_memory_reserved_mb:
+            self._overall_max_gpu_memory_reserved_mb = episode.max_gpu_memory_reserved_mb
+
+    def log_step(self, step: StepMetrics) -> None:
+        """Log a single step's metrics. Only recorded if log_step_metrics is True.
+
+        Also accumulates step-level timing for per-task step-level std computation.
+        """
+        if self.log_step_metrics:
+            record = asdict(step)
+            if record.get("fallback_used") is True:
+                if record.get("fallback_reason") in (None, ""):
+                    record["fallback_reason"] = "unknown"
+            else:
+                record["fallback_reason"] = "none"
+            self._step_records.append(record)
+
+        task_name = step.task_name
+        if step.total_step_wall_time_ms > 0:
+            self._task_step_wall_times[task_name].append(step.total_step_wall_time_ms)
+        if step.total_model_forward_time_ms > 0:
+            self._task_fw_times[task_name].append(step.total_model_forward_time_ms)
+        if step.cuda_latency_ms is not None:
+            self._task_cuda_times[task_name].append(step.cuda_latency_ms)
+        if step.preprocess_time_ms > 0:
+            self._task_preprocess_times[task_name].append(step.preprocess_time_ms)
+        if step.action_postprocess_time_ms > 0:
+            self._task_postprocess_times[task_name].append(step.action_postprocess_time_ms)
+        if step.delta_action > 0:
+            self._task_delta_actions[task_name].append(step.delta_action)
+        if step.jerk_action > 0:
+            self._task_jerk_actions[task_name].append(step.jerk_action)
+
+        # Geometry timing accumulators (only if geometry is enabled)
+        if step.token_mapping_time_ms is not None:
+            self._task_token_mapping_times[task_name].append(step.token_mapping_time_ms)
+        if step.geometry_score_time_ms is not None:
+            self._task_geometry_score_times[task_name].append(step.geometry_score_time_ms)
+        if step.pruning_time_ms is not None:
+            self._task_pruning_times[task_name].append(step.pruning_time_ms)
+        if step.depth_fetch_ms is not None:
+            self._task_depth_fetch_times[task_name].append(step.depth_fetch_ms)
+        if step.depth_sample_ms is not None:
+            self._task_depth_sample_times[task_name].append(step.depth_sample_ms)
+        if step.depth_edge_score_ms is not None:
+            self._task_depth_edge_score_times[task_name].append(step.depth_edge_score_ms)
+        if step.token_xyz_projection_ms is not None:
+            self._task_token_xyz_projection_times[task_name].append(step.token_xyz_projection_ms)
+        if step.score_fusion_ms is not None:
+            self._task_score_fusion_times[task_name].append(step.score_fusion_ms)
+        if step.depth_sampling_ms is not None:
+            self._task_depth_sampling_times[task_name].append(step.depth_sampling_ms)
+        if step.score_compute_ms is not None:
+            self._task_score_compute_times[task_name].append(step.score_compute_ms)
+        if step.selection_ms is not None:
+            self._task_selection_times[task_name].append(step.selection_ms)
+        if step.gather_ms is not None:
+            self._task_gather_times[task_name].append(step.gather_ms)
+        if step.edge_score_ms is not None:
+            self._task_edge_score_times[task_name].append(step.edge_score_ms)
+        if step.robot_mapping_ms is not None:
+            self._task_robot_mapping_times[task_name].append(step.robot_mapping_ms)
+        if step.near_score_ms is not None:
+            self._task_near_score_times[task_name].append(step.near_score_ms)
+        if step.corridor_score_ms is not None:
+            self._task_corridor_score_times[task_name].append(step.corridor_score_ms)
+        if step.contact_score_ms is not None:
+            self._task_contact_score_times[task_name].append(step.contact_score_ms)
+        if step.edge_selection_ms is not None:
+            self._task_edge_selection_times[task_name].append(step.edge_selection_ms)
+        if step.geo_selection_ms is not None:
+            self._task_geo_selection_times[task_name].append(step.geo_selection_ms)
+        if step.diverse_selection_ms is not None:
+            self._task_diverse_selection_times[task_name].append(step.diverse_selection_ms)
+        if step.final_merge_ms is not None:
+            self._task_final_merge_times[task_name].append(step.final_merge_ms)
+        if step.topk_pruning_ms is not None:
+            self._task_topk_pruning_times[task_name].append(step.topk_pruning_ms)
+        if step.hook_total_time_ms is not None:
+            self._task_hook_total_times[task_name].append(step.hook_total_time_ms)
+            if not step.is_warmup_step:
+                self._task_hook_total_times_excluding_warmup[task_name].append(step.hook_total_time_ms)
+        if step.geometry_total_time_ms is not None:
+            self._task_geometry_total_times[task_name].append(step.geometry_total_time_ms)
+
+        # Geometry score statistics accumulators
+        if step.geometry_score_mean is not None:
+            self._task_geometry_score_means[task_name].append(step.geometry_score_mean)
+        if step.geometry_score_max is not None:
+            self._task_geometry_score_maxes[task_name].append(step.geometry_score_max)
+        if step.geometry_score_std is not None:
+            self._task_geometry_score_stds[task_name].append(step.geometry_score_std)
+        if step.distance_score_mean is not None:
+            self._task_distance_score_means[task_name].append(step.distance_score_mean)
+        if step.direction_score_mean is not None:
+            self._task_direction_score_means[task_name].append(step.direction_score_mean)
+        if step.depth_edge_score_mean is not None:
+            self._task_depth_edge_score_means[task_name].append(step.depth_edge_score_mean)
+        if step.valid_token_ratio is not None:
+            self._task_valid_token_ratios[task_name].append(step.valid_token_ratio)
+        if step.d_min is not None:
+            self._task_d_mins[task_name].append(step.d_min)
+        if step.d_mean_topk is not None:
+            self._task_d_mean_topks[task_name].append(step.d_mean_topk)
+        if step.mean_near_score is not None:
+            self._task_mean_near_scores[task_name].append(step.mean_near_score)
+        if step.max_near_score is not None:
+            self._task_max_near_scores[task_name].append(step.max_near_score)
+        if step.motion_norm is not None:
+            self._task_motion_norms[task_name].append(step.motion_norm)
+        if step.corridor_strength_mean is not None:
+            self._task_corridor_strength_means[task_name].append(step.corridor_strength_mean)
+        if step.corridor_strength_topk_mean is not None:
+            self._task_corridor_strength_topk_means[task_name].append(step.corridor_strength_topk_mean)
+        if step.d_corridor_min is not None:
+            self._task_d_corridor_mins[task_name].append(step.d_corridor_min)
+        if step.d_corridor_mean_topk is not None:
+            self._task_d_corridor_mean_topks[task_name].append(step.d_corridor_mean_topk)
+        if step.dynamic_keep_ratio is not None:
+            self._task_dynamic_keep_ratios[task_name].append(step.dynamic_keep_ratio)
+        if step.dynamic_keep_k is not None:
+            self._task_dynamic_keep_ks[task_name].append(step.dynamic_keep_k)
+        if step.d_topk_mean is not None:
+            self._task_d_topk_means[task_name].append(step.d_topk_mean)
+        if step.corridor_strength is not None:
+            self._task_corridor_strengths[task_name].append(step.corridor_strength)
+        if step.edge_concentration is not None:
+            self._task_edge_concentrations[task_name].append(step.edge_concentration)
+        if step.valid_depth_ratio is not None:
+            self._task_valid_depth_ratios[task_name].append(step.valid_depth_ratio)
+        if step.dynamic_phase:
+            self._task_phase_counts[task_name][step.dynamic_phase] += 1
+        if step.K_edge_actual is not None:
+            self._task_K_edge_actuals[task_name].append(step.K_edge_actual)
+        if step.K_geo_actual is not None:
+            self._task_K_geo_actuals[task_name].append(step.K_geo_actual)
+        if step.K_diverse_actual is not None:
+            self._task_K_diverse_actuals[task_name].append(step.K_diverse_actual)
+        if step.geo_contact_score_topk_mean is not None:
+            self._task_geo_contact_score_topks[task_name].append(step.geo_contact_score_topk_mean)
+        if step.near_contact_score_topk_mean is not None:
+            self._task_near_contact_score_topks[task_name].append(step.near_contact_score_topk_mean)
+        if step.corridor_contact_score_topk_mean is not None:
+            self._task_corridor_contact_score_topks[task_name].append(step.corridor_contact_score_topk_mean)
+
+        # Visual token accumulators
+        if step.num_visual_tokens_original is not None:
+            self._task_vt_original[task_name].append(step.num_visual_tokens_original)
+        if step.num_visual_tokens_kept is not None:
+            self._task_vt_kept[task_name].append(step.num_visual_tokens_kept)
+
+        # New diagnostic accumulators
+        if step.action_has_nan is not None:
+            self._task_action_has_nan[task_name].append(step.action_has_nan)
+        if step.action_has_inf is not None:
+            self._task_action_has_inf[task_name].append(step.action_has_inf)
+        if step.action_min is not None:
+            self._task_action_min[task_name].append(step.action_min)
+        if step.action_max is not None:
+            self._task_action_max[task_name].append(step.action_max)
+        if step.action_mean is not None:
+            self._task_action_mean[task_name].append(step.action_mean)
+        if step.action_std is not None:
+            self._task_action_std[task_name].append(step.action_std)
+        if step.interaction_lock is not None:
+            lock_reason = step.interaction_lock_reason
+            if lock_reason is not None:
+                if "contact_risk" in lock_reason:
+                    self._task_contact_risk_lock[task_name].append(True)
+                if "gripper_proximity" in lock_reason:
+                    self._task_gripper_proximity_lock[task_name].append(True)
+                if "region_stability" in lock_reason:
+                    self._task_region_stability_lock[task_name].append(True)
+        if step.depth_valid_ratio is not None:
+            self._task_depth_valid_ratio[task_name].append(step.depth_valid_ratio)
+        if step.robot_state_valid is not None:
+            self._task_robot_state_valid[task_name].append(step.robot_state_valid)
+        if step.motion_direction_valid is not None:
+            self._task_motion_direction_valid[task_name].append(step.motion_direction_valid)
+        if step.distance_to_gripper_min is not None:
+            self._task_dist_gripper_min[task_name].append(step.distance_to_gripper_min)
+        if step.distance_to_gripper_mean is not None:
+            self._task_dist_gripper_mean[task_name].append(step.distance_to_gripper_mean)
+        if step.distance_to_gripper_max is not None:
+            self._task_dist_gripper_max[task_name].append(step.distance_to_gripper_max)
+        # P0: Depth conversion metadata
+        if step.depth_source_key is not None:
+            self._task_depth_source_key[task_name].append(step.depth_source_key)
+        if step.depth_conversion is not None:
+            self._task_depth_conversion[task_name].append(step.depth_conversion)
+        if step.depth_is_metric is not None:
+            self._task_depth_is_metric[task_name].append(step.depth_is_metric)
+        if step.depth_unit is not None:
+            self._task_depth_unit[task_name].append(step.depth_unit)
+        if step.depth_sim_available is not None:
+            self._task_depth_sim_available[task_name].append(step.depth_sim_available)
+        if step.depth_raw_min is not None:
+            self._task_depth_raw_min[task_name].append(step.depth_raw_min)
+        if step.depth_raw_max is not None:
+            self._task_depth_raw_max[task_name].append(step.depth_raw_max)
+        if step.depth_raw_mean is not None:
+            self._task_depth_raw_mean[task_name].append(step.depth_raw_mean)
+        if step.depth_raw_std is not None:
+            self._task_depth_raw_std[task_name].append(step.depth_raw_std)
+        if step.depth_metric_min is not None:
+            self._task_depth_metric_min[task_name].append(step.depth_metric_min)
+        if step.depth_metric_max is not None:
+            self._task_depth_metric_max[task_name].append(step.depth_metric_max)
+        if step.depth_metric_mean is not None:
+            self._task_depth_metric_mean[task_name].append(step.depth_metric_mean)
+        if step.depth_metric_std is not None:
+            self._task_depth_metric_std[task_name].append(step.depth_metric_std)
+        # Transform convention (P0-4)
+        if step.transform_convention is not None:
+            self._task_transform_convention[task_name].append(step.transform_convention)
+        if step.transform_inverse_used is not None:
+            self._task_transform_inverse_used[task_name].append(step.transform_inverse_used)
+        if step.transform_source is not None:
+            self._task_transform_source[task_name].append(step.transform_source)
+        if step.transform_convention_verified is not None:
+            self._task_transform_verified[task_name].append(step.transform_convention_verified)
+        if step.transform_convention_evidence is not None:
+            self._task_transform_evidence[task_name].append(step.transform_convention_evidence)
+
+    def _filter(self, records: List[Dict], key: str, value: Any) -> List[Dict]:
+        return [r for r in records if r.get(key) == value]
+
+    def _compute_stats(self, values: List[float]) -> Dict[str, float]:
+        if not values:
+            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+        n = len(values)
+        mean = sum(values) / n
+        variance = sum((v - mean) ** 2 for v in values) / n if n > 1 else 0.0
+        return {"mean": mean, "std": variance ** 0.5, "min": min(values), "max": max(values)}
+
+    def _per_task_stats(self, records: List[Dict], metric_key: str) -> Dict[str, Dict[str, float]]:
+        groups = defaultdict(list)
+        for r in records:
+            groups[r["task_name"]].append(r[metric_key])
+        return {tn: self._compute_stats(vals) for tn, vals in groups.items()}
+
+    def _task_groups(self, records: List[Dict]) -> Dict[str, List[Dict]]:
+        groups = defaultdict(list)
+        for r in records:
+            groups[r["task_name"]].append(r)
+        return dict(groups)
+
+    def save_summary(self) -> Dict[str, Any]:
+        """
+        Persist all logged data and return a summary dict.
+
+        Saves:
+            - summary.json
+            - episodes.jsonl
+            - episode_metrics.csv
+            - step_metrics.csv (if log_step_metrics=True)
+            - config.yaml (if config_dict provided)
+        """
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- episodes.jsonl (one record per episode) ----
+        episodes_jsonl_path = self.save_dir / "episodes.jsonl"
+        with open(episodes_jsonl_path, "w") as f:
+            for record in self._episode_records:
+                f.write(json.dumps(_to_python_native(record)) + "\n")
+
+        # ---- episode_metrics.csv ----
+        if self._episode_records:
+            ep_csv_path = self.save_dir / "episode_metrics.csv"
+            with open(ep_csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self._episode_records[0].keys())
+                writer.writeheader()
+                writer.writerows(_to_python_native(r) for r in self._episode_records)
+
+        # ---- step_metrics.csv ----
+        if self._step_records:
+            step_csv_path = self.save_dir / "step_metrics.csv"
+            with open(step_csv_path, "w", newline="") as f:
+                step_fieldnames = [field.name for field in fields(StepMetrics)]
+                for record in self._step_records:
+                    for key in record.keys():
+                        if key not in step_fieldnames:
+                            step_fieldnames.append(key)
+                writer = csv.DictWriter(f, fieldnames=step_fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(_to_python_native(r) for r in self._step_records)
+
+        # ---- Build and save summary ----
+        summary = self._build_summary()
+        summary_path = self.save_dir / "summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        # ---- config.yaml ----
+        if self.config_dict:
+            import yaml
+            config_path = self.save_dir / "config.yaml"
+            with open(config_path, "w") as f:
+                yaml.dump(self.config_dict, f, default_flow_style=False)
+
+        return summary
+
+    def _build_summary(self) -> Dict[str, Any]:
+        """Compute and return the summary statistics.
+
+        Key design decisions:
+        - preprocess_time_ms / action_postprocess_time_ms: null if NullTimer (not timed)
+        - success_only/failure_only fields: null for empty subsets
+        - max_delta_action / max_jerk_action: step-level global max (not episode-mean max)
+        - mean_step_wall_time_ms_episode_avg: mean of per-episode means
+        - mean_step_wall_time_ms_global: total wall time / total steps across all episodes
+        - per_task std: step-level std (computed from accumulated step records)
+        """
+        records = self._episode_records
+        step_records = self._step_records
+        n = len(records)
+
+        if n == 0:
+            return {"model": "OpenVLA", "num_episodes": 0, "overall_success_rate": 0.0,
+                    "message": "No episodes recorded."}
+
+        # ---- All / Success / Failure splits ----
+        successes = [r for r in records if r.get("success")]
+        failures = [r for r in records if not r.get("success")]
+        timeouts = [r for r in records if r.get("timeout")]
+
+        n_success = len(successes)
+        n_failure = len(failures)
+        n_timeout = len(timeouts)
+
+        def _split_stats(subset: List[Dict], key: str) -> Dict[str, float]:
+            """Episode-level stats: null if subset is empty (Fix 2)."""
+            vals = [r[key] for r in subset if isinstance(r.get(key), (int, float))]
+            if not vals:
+                return {"mean": None, "std": None, "min": None, "max": None}
+            n = len(vals)
+            mean = sum(vals) / n
+            variance = sum((v - mean) ** 2 for v in vals) / n if n > 1 else 0.0
+            return {"mean": mean, "std": variance ** 0.5, "min": min(vals), "max": max(vals)}
+
+        # ---- Global step-level aggregates (from step_metrics.csv records) ----
+        all_step_deltas = [r["delta_action"] for r in step_records
+                           if isinstance(r.get("delta_action"), (int, float)) and r["delta_action"] > 0]
+        all_step_jerks = [r["jerk_action"] for r in step_records
+                          if isinstance(r.get("jerk_action"), (int, float)) and r["jerk_action"] > 0]
+        all_step_wall_times = [r["total_step_wall_time_ms"] for r in step_records
+                                if isinstance(r.get("total_step_wall_time_ms"), (int, float))
+                                and r["total_step_wall_time_ms"] > 0]
+        all_step_fw_times = [r["total_model_forward_time_ms"] for r in step_records
+                              if isinstance(r.get("total_model_forward_time_ms"), (int, float))
+                              and r["total_model_forward_time_ms"] > 0]
+        all_step_preprocess = [r["preprocess_time_ms"] for r in step_records
+                                if isinstance(r.get("preprocess_time_ms"), (int, float))
+                                and r["preprocess_time_ms"] > 0]
+        all_step_postprocess = [r["action_postprocess_time_ms"] for r in step_records
+                                 if isinstance(r.get("action_postprocess_time_ms"), (int, float))
+                                 and r["action_postprocess_time_ms"] > 0]
+
+        def _step_level_stats(values: List[float]) -> Dict[str, float]:
+            if not values:
+                return {"mean": None, "std": None, "min": None, "max": None}
+            n = len(values)
+            mean = sum(values) / n
+            variance = sum((v - mean) ** 2 for v in values) / n if n > 1 else 0.0
+            return {"mean": mean, "std": variance ** 0.5, "min": min(values), "max": max(values)}
+
+        # Fix 3: step-level max delta/jerk (not episode-mean max)
+        delta_all_step = _step_level_stats(all_step_deltas)
+        jerk_all_step = _step_level_stats(all_step_jerks)
+
+        # Fix 4: step wall time stats
+        step_wall_episode_avg = _mean_std(
+            [r["mean_step_wall_time_ms"] for r in records
+             if isinstance(r.get("mean_step_wall_time_ms"), (int, float))]
+        )
+        # Global: sum of per-episode wall times / sum of per-episode steps
+        # Use episode_time_sec (total elapsed wall time) and num_steps (total steps including settle)
+        # to avoid bias from first-step warmup spikes that inflate individual step_times lists.
+        total_episode_time_ms = sum(r["episode_time_sec"] * 1000 for r in records
+                                    if isinstance(r.get("episode_time_sec"), (int, float)))
+        total_num_steps = sum(r["num_steps"] for r in records
+                              if isinstance(r.get("num_steps"), (int, float)))
+        step_wall_global_mean = total_episode_time_ms / total_num_steps if total_num_steps > 0 else None
+        # global std/min/max are ambiguous for the ratio metric; set to null to avoid misuse
+        step_wall_global_std = None
+        step_wall_global_min = None
+        step_wall_global_max = None
+
+        # Fix 1: preprocess/postprocess â€?null if not timed
+        preprocess_step_stats = _step_level_stats(all_step_preprocess)
+        postprocess_step_stats = _step_level_stats(all_step_postprocess)
+
+        # ---- Global aggregates ----
+        steps_all = _split_stats(records, "num_steps")
+        steps_success = _split_stats(successes, "num_steps")
+        steps_failure = _split_stats(failures, "num_steps")
+
+        time_all = _split_stats(records, "episode_time_sec")
+        time_success = _split_stats(successes, "episode_time_sec")
+        time_failure = _split_stats(failures, "episode_time_sec")
+
+        fw_all = _mean_std(
+            [r["mean_model_forward_time_ms"] for r in records
+             if isinstance(r.get("mean_model_forward_time_ms"), (int, float))]
+        )
+        fw_success = _mean_std(
+            [r["mean_model_forward_time_ms"] for r in successes
+             if isinstance(r.get("mean_model_forward_time_ms"), (int, float))]
+        )
+
+        # CUDA latency: aggregate across episodes
+        cuda_latency_vals = [r["mean_cuda_latency_ms"] for r in records
+                              if r.get("mean_cuda_latency_ms") is not None]
+        cuda_latency_all = _mean_std(cuda_latency_vals) if cuda_latency_vals else None
+        cuda_latency_summary = None
+        if cuda_latency_all is not None:
+            cuda_latency_summary = {
+                "mean": round(cuda_latency_all["mean"], 2),
+                "std": round(cuda_latency_all["std"], 2),
+                "min": round(cuda_latency_all["min"], 2),
+                "max": round(cuda_latency_all["max"], 2),
+            }
+
+        gripper_changes = sum(r.get("gripper_change_count", 0) for r in records)
+        mem_list = [r["max_gpu_memory_mb"] for r in records if r.get("max_gpu_memory_mb")]
+        mem_mean = sum(mem_list) / len(mem_list) if mem_list else 0.0
+
+        # Sub-module timing: compute mean across episodes, returning None if all null
+        def _nullable_mean(key: str) -> Optional[float]:
+            vals = [r[key] for r in records if r.get(key) is not None]
+            return round(sum(vals) / len(vals), 4) if vals else None
+
+        # ---- Visual token stats ----
+        # For baseline, all episodes should have the same token counts (no pruning)
+        vt_original_vals = [r["num_visual_tokens_original"] for r in records
+                            if r.get("num_visual_tokens_original") is not None]
+        vt_kept_vals = [r["num_visual_tokens_kept"] for r in records
+                        if r.get("num_visual_tokens_kept") is not None]
+
+        # General mode for any type (str, bool, None, etc.)
+        def _mode_any(vals):
+            if not vals:
+                return None
+            return Counter(vals).most_common(1)[0][0]
+
+        def _first_non_null(vals):
+            for v in vals:
+                if v is not None and v != "":
+                    return str(v)
+            return None
+
+        # Use mode (most common value) for token counts as they should be constant
+        def _mode(vals: List[float]) -> Optional[float]:
+            if not vals:
+                return None
+            return Counter(vals).most_common(1)[0][0]
+
+        # Per-encoder breakdown: aggregate from episode records
+        def _mode_dict(vals: List[Dict]) -> Optional[Dict[str, int]]:
+            if not vals:
+                return None
+            # Count occurrences of each dict content
+            counter = Counter()
+            for v in vals:
+                key = json.dumps(v, sort_keys=True)
+                counter[key] += 1
+            if not counter:
+                return None
+            most_common_key = counter.most_common(1)[0][0]
+            return json.loads(most_common_key)
+
+        vt_per_encoder_vals = [r["num_visual_tokens_per_encoder"] for r in records
+                               if r.get("num_visual_tokens_per_encoder") is not None]
+
+        num_visual_tokens_original = _mode(vt_original_vals)
+        num_visual_tokens_kept = _mode(vt_kept_vals)
+        num_visual_tokens_per_encoder = _mode_dict(vt_per_encoder_vals)
+
+        # ---- Frequency calculations ----
+        # Use episode_avg for frequency to match legacy semantics
+        mean_step_wall_ep_avg = step_wall_episode_avg["mean"]
+        control_frequency_hz = round(1000.0 / mean_step_wall_ep_avg, 2) if mean_step_wall_ep_avg > 0 else None
+        mean_fw = fw_all["mean"]
+        model_only_frequency_hz = round(1000.0 / mean_fw, 2) if mean_fw > 0 else None
+        if cuda_latency_summary is not None and cuda_latency_summary.get("mean", 0) > 0:
+            cuda_only_frequency_hz = round(1000.0 / cuda_latency_summary["mean"], 2)
+        else:
+            cuda_only_frequency_hz = None
+
+        # ---- Per-task breakdown ----
+        task_groups = self._task_groups(records)
+        num_tasks_evaluated = len(task_groups)
+
+        per_task_summary = {}
+        for task_name, task_records in task_groups.items():
+            t_successes = [r for r in task_records if r.get("success")]
+            t_failures = [r for r in task_records if not r.get("success")]
+            t_timeouts = [r for r in task_records if r.get("timeout")]
+
+            t_steps_all = [r["num_steps"] for r in task_records if isinstance(r.get("num_steps"), (int, float))]
+            # Fix 2: null for empty subsets
+            t_steps_success = [r["num_steps"] for r in t_successes if isinstance(r.get("num_steps"), (int, float))]
+            t_steps_failure = [r["num_steps"] for r in t_failures if isinstance(r.get("num_steps"), (int, float))]
+
+            t_fw = [r["mean_model_forward_time_ms"] for r in task_records
+                     if isinstance(r.get("mean_model_forward_time_ms"), (int, float))]
+            # Fix 1 (final): per_task timing fields must be null when not measured.
+            # Filter out both None and 0.0 so old runs (which wrote 0.0) are treated as null.
+            t_pre = [r["mean_preprocess_time_ms"] for r in task_records
+                     if r.get("mean_preprocess_time_ms") not in (None, 0.0)]
+            t_post = [r["mean_action_postprocess_time_ms"] for r in task_records
+                      if r.get("mean_action_postprocess_time_ms") not in (None, 0.0)]
+            t_delta_ep = [r["mean_delta_action"] for r in task_records
+                          if isinstance(r.get("mean_delta_action"), (int, float))]
+            t_jerk_ep = [r["mean_jerk_action"] for r in task_records
+                          if isinstance(r.get("mean_jerk_action"), (int, float))]
+            t_gripper = sum(r.get("gripper_change_count", 0) for r in task_records)
+            t_step_wall = [r["mean_step_wall_time_ms"] for r in task_records
+                           if isinstance(r.get("mean_step_wall_time_ms"), (int, float))]
+            t_mem = [r["max_gpu_memory_mb"] for r in task_records if r.get("max_gpu_memory_mb")]
+
+            # Fix 5: step-level std from accumulated data
+            t_step_wall_list = self._task_step_wall_times.get(task_name, [])
+            t_fw_list = self._task_fw_times.get(task_name, [])
+            t_cuda_list = self._task_cuda_times.get(task_name, [])
+            t_pre_list = self._task_preprocess_times.get(task_name, [])
+            t_post_list = self._task_postprocess_times.get(task_name, [])
+            t_delta_list = self._task_delta_actions.get(task_name, [])
+            t_jerk_list = self._task_jerk_actions.get(task_name, [])
+
+            def _list_std(vals: List[float]) -> Optional[float]:
+                return round(float(np.std(vals)), 4) if len(vals) > 1 else None
+
+            def _list_max(vals: List[float]) -> Optional[float]:
+                return max(vals) if vals else None
+
+            t_std_step_wall = _list_std(t_step_wall_list)
+            t_std_fw = _list_std(t_fw_list)
+            t_std_pre = _list_std(t_pre_list)
+            t_std_post = _list_std(t_post_list)
+            # Fix 3: step-level max delta/jerk per task
+            t_max_delta = _list_max(t_delta_list)
+            t_max_jerk = _list_max(t_jerk_list)
+
+            # CUDA latency per task (episode-level mean, step-level std)
+            t_cuda_ep = [r["mean_cuda_latency_ms"] for r in task_records
+                          if r.get("mean_cuda_latency_ms") is not None]
+            t_cuda_mean = _safe_mean(t_cuda_ep) if t_cuda_ep else None
+            t_cuda_std = _list_std(t_cuda_list)
+
+            # Token counts per task
+            t_vt_orig = [r["num_visual_tokens_original"] for r in task_records
+                          if r.get("num_visual_tokens_original") is not None]
+            t_vt_kept = [r["num_visual_tokens_kept"] for r in task_records
+                          if r.get("num_visual_tokens_kept") is not None]
+            t_vt_orig_mode = _mode(t_vt_orig) if t_vt_orig else None
+            t_vt_kept_mode = _mode(t_vt_kept) if t_vt_kept else None
+            t_vt_pruned = (t_vt_orig_mode - t_vt_kept_mode) if (
+                t_vt_orig_mode is not None and t_vt_kept_mode is not None
+            ) else None
+            t_token_retention = (t_vt_kept_mode / t_vt_orig_mode) if t_vt_orig_mode else None
+            t_token_pruning = (1.0 - t_token_retention) if t_token_retention is not None else None
+
+            t_effective_retention = _safe_mean([
+                r["effective_retention"] for r in task_records
+                if isinstance(r.get("effective_retention"), (int, float))
+            ])
+            t_projector_retention = _safe_mean([
+                r["projector_retention"] for r in task_records
+                if isinstance(r.get("projector_retention"), (int, float))
+            ])
+            t_internal_retention = _safe_mean([
+                r["internal_retention"] for r in task_records
+                if isinstance(r.get("internal_retention"), (int, float))
+            ])
+            t_effective_visual_tokens = _safe_mean([
+                r["effective_visual_tokens_for_llm"] for r in task_records
+                if isinstance(r.get("effective_visual_tokens_for_llm"), (int, float))
+            ])
+            # Per-task frequencies
+            t_step_wall_mean = _safe_mean(t_step_wall)
+            t_fw_mean = _safe_mean(t_fw)
+            t_control_freq = round(1000.0 / t_step_wall_mean, 2) if t_step_wall_mean > 0 else None
+            t_model_freq = round(1000.0 / t_fw_mean, 2) if t_fw_mean > 0 else None
+            t_cuda_freq = round(1000.0 / t_cuda_mean, 2) if t_cuda_mean is not None and t_cuda_mean > 0 else None
+            phase_counts = self._task_phase_counts.get(task_name, Counter())
+            phase_total = sum(phase_counts.values())
+
+            per_task_summary[task_name] = {
+                # Counts
+                "num_episodes": len(task_records),
+                "num_success": len(t_successes),
+                "num_failure": len(t_failures),
+                "num_timeout": len(t_timeouts),
+                # Rates
+                "success_rate": len(t_successes) / len(task_records) if task_records else 0.0,
+                "timeout_rate": len(t_timeouts) / len(task_records) if task_records else 0.0,
+                # Steps (Fix 2: null for empty subsets)
+                "mean_steps_all": _safe_mean(t_steps_all),
+                "mean_steps_success_only": _safe_mean(t_steps_success) if t_steps_success else None,
+                "mean_steps_failure_only": _safe_mean(t_steps_failure) if t_steps_failure else None,
+                # Timing
+                "mean_episode_time_sec": _safe_mean(
+                    [r["episode_time_sec"] for r in task_records
+                     if isinstance(r.get("episode_time_sec"), (int, float))]),
+                "mean_step_wall_time_ms": t_step_wall_mean,
+                "mean_end_to_end_step_wall_time_ms": t_step_wall_mean,
+                "std_step_wall_time_ms": t_std_step_wall,
+                "mean_model_forward_time_ms": t_fw_mean,
+                "mean_model_forward_ms": t_fw_mean,
+                "std_model_forward_time_ms": t_std_fw,
+                # Fix 1: null if not timed
+                "mean_preprocess_time_ms": _safe_mean(t_pre) if t_pre else None,
+                "std_preprocess_time_ms": t_std_pre,
+                "mean_action_postprocess_time_ms": _safe_mean(t_post) if t_post else None,
+                "std_action_postprocess_time_ms": t_std_post,
+                # CUDA latency
+                "mean_cuda_latency_ms": t_cuda_mean,
+                "std_cuda_latency_ms": t_cuda_std,
+                # Frequency
+                "control_frequency_hz": t_control_freq,
+                "model_only_frequency_hz": t_model_freq,
+                "cuda_only_frequency_hz": t_cuda_freq,
+                # GPU memory
+                "mean_gpu_memory_mb": _safe_mean(t_mem),
+                "max_gpu_memory_mb": max(t_mem) if t_mem else 0.0,
+                # Action smoothness (Fix 3: step-level max)
+                "mean_delta_action": _safe_mean(t_delta_ep),
+                "max_delta_action": t_max_delta,
+                "mean_jerk_action": _safe_mean(t_jerk_ep),
+                "max_jerk_action": t_max_jerk,
+                "total_gripper_changes": t_gripper,
+                # Visual tokens
+                "num_visual_tokens_original": t_vt_orig_mode,
+                "num_visual_tokens_kept": t_vt_kept_mode,
+                "num_visual_tokens_pruned": t_vt_pruned,
+                "token_retention_ratio": t_effective_retention if t_effective_retention is not None else t_token_retention,
+                "token_pruning_ratio": (1.0 - t_effective_retention) if t_effective_retention is not None else t_token_pruning,
+                "raw_projector_token_retention_ratio": t_token_retention,
+                "effective_retention": t_effective_retention,
+                "projector_retention": t_projector_retention,
+                "internal_retention": t_internal_retention,
+                "effective_visual_tokens_for_llm": t_effective_visual_tokens,
+                # Geometry timing (from step accumulators)
+                "mean_token_mapping_time_ms": _nullable_list_mean(self._task_token_mapping_times.get(task_name, [])),
+                "mean_geometry_score_time_ms": _nullable_list_mean(self._task_geometry_score_times.get(task_name, [])),
+                "mean_pruning_time_ms": _nullable_list_mean(self._task_pruning_times.get(task_name, [])),
+                "mean_depth_fetch_ms": _nullable_list_mean(self._task_depth_fetch_times.get(task_name, [])),
+                "mean_depth_sample_ms": _nullable_list_mean(self._task_depth_sample_times.get(task_name, [])),
+                "mean_depth_edge_score_ms": _nullable_list_mean(self._task_depth_edge_score_times.get(task_name, [])),
+                "mean_token_xyz_projection_ms": _nullable_list_mean(self._task_token_xyz_projection_times.get(task_name, [])),
+                "mean_score_fusion_ms": _nullable_list_mean(self._task_score_fusion_times.get(task_name, [])),
+                "mean_depth_sampling_ms": _nullable_list_mean(self._task_depth_sampling_times.get(task_name, [])),
+                "mean_score_compute_ms": _nullable_list_mean(self._task_score_compute_times.get(task_name, [])),
+                "mean_selection_ms": _nullable_list_mean(self._task_selection_times.get(task_name, [])),
+                "mean_gather_ms": _nullable_list_mean(self._task_gather_times.get(task_name, [])),
+                "mean_topk_pruning_ms": _nullable_list_mean(self._task_topk_pruning_times.get(task_name, [])),
+                "mean_hook_total_ms": _nullable_list_mean(self._task_hook_total_times.get(task_name, [])),
+                "mean_geometry_total_time_ms": _nullable_list_mean(self._task_geometry_total_times.get(task_name, [])),
+                # Geometry score statistics (from step accumulators)
+                "geometry_score_mean": _nullable_list_mean(self._task_geometry_score_means.get(task_name, [])),
+                "geometry_score_max": max(self._task_geometry_score_maxes.get(task_name, [])) if self._task_geometry_score_maxes.get(task_name, []) else None,
+                "geometry_score_std": _nullable_list_mean(self._task_geometry_score_stds.get(task_name, [])),
+                "distance_score_mean": _nullable_list_mean(self._task_distance_score_means.get(task_name, [])),
+                "direction_score_mean": _nullable_list_mean(self._task_direction_score_means.get(task_name, [])),
+                "depth_edge_score_mean": _nullable_list_mean(self._task_depth_edge_score_means.get(task_name, [])),
+                "valid_token_ratio_mean": _nullable_list_mean(self._task_valid_token_ratios.get(task_name, [])),
+                "d_min": _nullable_list_mean(self._task_d_mins.get(task_name, [])),
+                "d_mean_topk": _nullable_list_mean(self._task_d_mean_topks.get(task_name, [])),
+                "mean_near_score": _nullable_list_mean(self._task_mean_near_scores.get(task_name, [])),
+                "max_near_score": max(self._task_max_near_scores.get(task_name, [])) if self._task_max_near_scores.get(task_name, []) else None,
+                "motion_norm": _nullable_list_mean(self._task_motion_norms.get(task_name, [])),
+                "corridor_strength_mean": _nullable_list_mean(self._task_corridor_strength_means.get(task_name, [])),
+                "corridor_strength_topk_mean": _nullable_list_mean(self._task_corridor_strength_topk_means.get(task_name, [])),
+                "d_corridor_min": _nullable_list_mean(self._task_d_corridor_mins.get(task_name, [])),
+                "d_corridor_mean_topk": _nullable_list_mean(self._task_d_corridor_mean_topks.get(task_name, [])),
+                "mean_keep_ratio": _nullable_list_mean(self._task_dynamic_keep_ratios.get(task_name, [])),
+                "mean_keep_k": _nullable_list_mean(self._task_dynamic_keep_ks.get(task_name, [])),
+                "d_topk_mean": _nullable_list_mean(self._task_d_topk_means.get(task_name, [])),
+                "corridor_strength": _nullable_list_mean(self._task_corridor_strengths.get(task_name, [])),
+                "edge_concentration": _nullable_list_mean(self._task_edge_concentrations.get(task_name, [])),
+                "valid_depth_ratio": _nullable_list_mean(self._task_valid_depth_ratios.get(task_name, [])),
+                "phase_ratio_far": (phase_counts.get("far", 0) / phase_total) if phase_total else None,
+                "phase_ratio_mid": (phase_counts.get("mid", 0) / phase_total) if phase_total else None,
+                "phase_ratio_near": (phase_counts.get("near", 0) / phase_total) if phase_total else None,
+                "phase_ratio_fallback_safe": (phase_counts.get("fallback_safe", 0) / phase_total) if phase_total else None,
+                "action_mean": _nullable_list_mean(self._task_action_mean.get(task_name, [])),
+                "action_std": _nullable_list_mean(self._task_action_std.get(task_name, [])),
+                "contact_risk_lock_ratio": _nullable_list_mean([
+                    1.0 if v else 0.0 for v in self._task_contact_risk_lock.get(task_name, [])
+                ]) if self._task_contact_risk_lock.get(task_name) else None,
+                "gripper_proximity_lock_ratio": _nullable_list_mean([
+                    1.0 if v else 0.0 for v in self._task_gripper_proximity_lock.get(task_name, [])
+                ]) if self._task_gripper_proximity_lock.get(task_name) else None,
+                "region_stability_lock_ratio": _nullable_list_mean([
+                    1.0 if v else 0.0 for v in self._task_region_stability_lock.get(task_name, [])
+                ]) if self._task_region_stability_lock.get(task_name) else None,
+                # P0: Depth conversion metadata (mode for categoricals, mean for numerics)
+                "depth_source_key": _mode_any(self._task_depth_source_key.get(task_name, [])),
+                "depth_conversion": _mode_any(self._task_depth_conversion.get(task_name, [])),
+                "depth_is_metric": _mode_any(self._task_depth_is_metric.get(task_name, [])),
+                "depth_unit": _mode_any(self._task_depth_unit.get(task_name, [])),
+                "depth_sim_available": _mode_any(self._task_depth_sim_available.get(task_name, [])),
+                "depth_raw_min": _nullable_list_mean(self._task_depth_raw_min.get(task_name, [])),
+                "depth_raw_max": _nullable_list_mean(self._task_depth_raw_max.get(task_name, [])),
+                "depth_raw_mean": _nullable_list_mean(self._task_depth_raw_mean.get(task_name, [])),
+                "depth_raw_std": _nullable_list_mean(self._task_depth_raw_std.get(task_name, [])),
+                "depth_metric_min": _nullable_list_mean(self._task_depth_metric_min.get(task_name, [])),
+                "depth_metric_max": _nullable_list_mean(self._task_depth_metric_max.get(task_name, [])),
+                "depth_metric_mean": _nullable_list_mean(self._task_depth_metric_mean.get(task_name, [])),
+                "depth_metric_std": _nullable_list_mean(self._task_depth_metric_std.get(task_name, [])),
+                # Transform convention (P0-4: T_robot_cam_forward)
+                "transform_convention": _mode_any(self._task_transform_convention.get(task_name, [])),
+                "transform_inverse_used": _mode_any(self._task_transform_inverse_used.get(task_name, [])),
+                "transform_source": _mode_any(self._task_transform_source.get(task_name, [])),
+                "transform_convention_verified": _mode_any(self._task_transform_verified.get(task_name, [])),
+                "transform_convention_evidence": _first_non_null(self._task_transform_evidence.get(task_name, [])),
+            }
+
+        # ---- Baseline speedup / preservation metrics ----
+        pruning_method = self.config_dict.get("pruning_mode", "none")
+        is_baseline = (pruning_method == "none")
+
+        speedup = 1.0
+        speedup_model_forward = 1.0
+        speedup_step_wall = 1.0
+        speedup_cuda = 1.0 if cuda_latency_summary is not None else None
+        latency_reduction_percent = 0.0
+        relative_success_rate = 1.0
+        performance_preservation_ratio = 100.0
+        success_drop_percent = 0.0
+
+        # ---- Visual token summary ----
+        token_retention_ratio = (
+            num_visual_tokens_kept / num_visual_tokens_original
+            if num_visual_tokens_original else None
+        )
+        token_pruning_ratio = (
+            1.0 - token_retention_ratio if token_retention_ratio is not None else None
+        )
+        num_visual_tokens_pruned = (
+            num_visual_tokens_original - num_visual_tokens_kept
+            if num_visual_tokens_original is not None and num_visual_tokens_kept is not None else None
+        )
+        actual_keep_ratio_vals = []
+        for task_name, orig_vals in self._task_vt_original.items():
+            kept_vals = self._task_vt_kept.get(task_name, [])
+            actual_keep_ratio_vals.extend(
+                kept / orig for orig, kept in zip(orig_vals, kept_vals) if orig
+            )
+
+        # ---- Hybrid v1 / temporal step-level aggregations ----
+        hook_overhead_vals = []
+        hybrid_score_vals = []
+        edge_score_vals = []
+        interaction_lock_count = 0
+        ema_used_count = 0
+        adaptive_th_vals = []
+        step_count = 0
+        for r in self._step_records:
+            step_count += 1
+            v = r.get("hook_overhead_ms")
+            if isinstance(v, (int, float)) and v > 0:
+                hook_overhead_vals.append(v)
+            v = r.get("hybrid_score_mean")
+            if isinstance(v, (int, float)):
+                hybrid_score_vals.append(v)
+            v = r.get("edge_score_mean")
+            if isinstance(v, (int, float)):
+                edge_score_vals.append(v)
+            v = r.get("interaction_lock")
+            if str(v) == "True":
+                interaction_lock_count += 1
+            v = r.get("ema_used_for_selection")
+            if str(v) == "True":
+                ema_used_count += 1
+            v = r.get("adaptive_threshold_mean")
+            if isinstance(v, (int, float)):
+                adaptive_th_vals.append(v)
+
+        # ---- FLOPs ----
+        # Exact profiler FLOPs are only available in dedicated runs with
+        # --enable_torch_profiler_flops true. Keep the legacy fields as aliases
+        # for the profiler mean when present; otherwise leave them explicitly
+        # unavailable rather than conflating FLOPs with token compression.
+        flops_T = None
+        flop_ratio = 1.0
+        flop_reduction_percent = 0.0
+        flops_estimation_method = "not_available"
+        global_phase_counts = Counter()
+        for counts in self._task_phase_counts.values():
+            global_phase_counts.update(counts)
+        global_phase_total = sum(global_phase_counts.values())
+        def _step_numeric_values(key: str) -> List[float]:
+            vals = []
+            for record in self._step_records:
+                value = record.get(key)
+                if value in (None, ""):
+                    continue
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(value):
+                    vals.append(value)
+            return vals
+
+        def _step_bool_ratio(key: str) -> Optional[float]:
+            vals = []
+            for record in self._step_records:
+                value = record.get(key)
+                if value in (None, ""):
+                    continue
+                if isinstance(value, str):
+                    vals.append(value.strip().lower() == "true")
+                else:
+                    vals.append(bool(value))
+            return sum(vals) / len(vals) if vals else None
+
+        def _step_distribution(key: str) -> Optional[Dict[str, float]]:
+            values = [str(record.get(key)) for record in self._step_records if record.get(key) not in (None, "")]
+            if not values:
+                return None
+            counts = Counter(values)
+            total = float(len(values))
+            return {name: count / total for name, count in sorted(counts.items())}
+
+        def _step_value_counts(key: str, *, only_fallback: bool = False) -> Optional[Dict[str, int]]:
+            values = []
+            for record in self._step_records:
+                if only_fallback:
+                    fallback_value = record.get("fallback_used")
+                    if isinstance(fallback_value, str):
+                        is_fallback = fallback_value.strip().lower() == "true"
+                    else:
+                        is_fallback = bool(fallback_value)
+                    if not is_fallback:
+                        continue
+                value = record.get(key)
+                if value in (None, "", "none", "None"):
+                    continue
+                values.append(str(value))
+            if not values:
+                return None
+            return dict(sorted(Counter(values).items()))
+
+        def _step_first_non_empty(key: str) -> Optional[str]:
+            for record in self._step_records:
+                value = record.get(key)
+                if value not in (None, "", "none", "None"):
+                    return str(value)
+            return None
+
+        def _step_first_present(key: str) -> Optional[str]:
+            for record in self._step_records:
+                value = record.get(key)
+                if value not in (None, ""):
+                    return str(value)
+            return None
+
+        profiler_exact_flops_vals = _step_numeric_values("profiler_exact_flops")
+        profiler_exact_flops_mean = _nullable_list_mean(profiler_exact_flops_vals)
+        profiler_exact_flops_std = _nullable_list_std(profiler_exact_flops_vals)
+        profiler_exact_flops_available_steps = sum(
+            1
+            for record in self._step_records
+            if record.get("profiler_exact_flops_available") is True
+            or str(record.get("profiler_exact_flops_available")).strip().lower() == "true"
+        )
+        profiler_exact_flops_profiled_steps = sum(
+            1
+            for record in self._step_records
+            if record.get("profiler_exact_flops_profiled") is True
+            or str(record.get("profiler_exact_flops_profiled")).strip().lower() == "true"
+        )
+        profiler_exact_flops_events_vals = _step_numeric_values("profiler_exact_flops_events")
+        profiler_exact_flops_events_mean = _nullable_list_mean(profiler_exact_flops_events_vals)
+        profiler_trace_profiled_steps = sum(
+            1
+            for record in self._step_records
+            if record.get("profiler_trace_profiled") is True
+            or str(record.get("profiler_trace_profiled")).strip().lower() == "true"
+        )
+        profiler_exact_flops_available = bool(profiler_exact_flops_vals)
+        if profiler_exact_flops_available and profiler_exact_flops_mean is not None:
+            flops_T = profiler_exact_flops_mean / 1e12
+            flops_estimation_method = "torch.profiler.with_flops"
+
+        dynamic_keep_ratio_step_vals = _step_numeric_values("dynamic_keep_ratio")
+        geo_risk_distribution = _step_distribution("geo_risk_level")
+        interaction_lock_ratio = _step_bool_ratio("interaction_lock")
+        fallback_ratio = _step_bool_ratio("fallback_used")
+        fallback_reason_counts = _step_value_counts("fallback_reason", only_fallback=True)
+        requested_keep_ratio_step_vals = _step_numeric_values("requested_keep_ratio")
+        keep_ratio_source_distribution = _step_distribution("keep_ratio_source")
+        effective_keep_count_step_vals = _step_numeric_values("effective_keep_count")
+        original_token_count_step_vals = _step_numeric_values("original_token_count")
+        effective_retention_step_vals = _step_numeric_values("effective_retention")
+        projector_retention_step_vals = _step_numeric_values("projector_retention")
+        internal_retention_step_vals = _step_numeric_values("internal_retention")
+        effective_visual_tokens_step_vals = _step_numeric_values("effective_visual_tokens_for_llm")
+        original_visual_step_vals = _step_numeric_values("original_visual_tokens")
+        kept_visual_step_vals = _step_numeric_values("kept_visual_tokens")
+        pruned_visual_step_vals = _step_numeric_values("pruned_visual_tokens")
+        llm_seq_before_prune_step_vals = _step_numeric_values("llm_input_seq_len_before_prune")
+        llm_seq_after_prune_step_vals = _step_numeric_values("llm_input_seq_len_after_prune")
+        llm_seq_pruned_step_vals = _step_numeric_values("llm_input_seq_len_pruned")
+        internal_original_visual_step_vals = _step_numeric_values("internal_original_visual_tokens")
+        internal_kept_visual_step_vals = _step_numeric_values("internal_kept_visual_tokens")
+        internal_pruned_visual_step_vals = _step_numeric_values("internal_pruned_visual_tokens")
+        internal_original_seq_step_vals = _step_numeric_values("internal_original_seq_length")
+        internal_kept_seq_step_vals = _step_numeric_values("internal_kept_seq_length")
+        internal_pruned_seq_step_vals = _step_numeric_values("internal_pruned_seq_length")
+        internal_total_layers_step_vals = _step_numeric_values("internal_total_layers")
+        internal_first_short_layer_step_vals = _step_numeric_values("internal_first_short_layer")
+        internal_shortened_layer_step_vals = _step_numeric_values("internal_shortened_layer_count")
+        internal_post_prune_layer_step_vals = _step_numeric_values("internal_post_prune_layer_count")
+        internal_post_prune_ratio_step_vals = _step_numeric_values("internal_post_prune_layer_ratio")
+        internal_kv_short_layer_step_vals = _step_numeric_values("internal_kv_cache_short_length_layer_count")
+        internal_kv_reduction_step_vals = _step_numeric_values("internal_kv_cache_token_reduction_ratio")
+        internal_kv_mean_len_step_vals = _step_numeric_values("internal_kv_cache_mean_seq_len")
+        decode_effective_kv_step_vals = _step_numeric_values("decode_effective_kv_tokens_mean")
+        compression_backend_distribution = _step_distribution("compression_backend")
+        score_ema_available_ratio = _step_bool_ratio("score_ema_available")
+        lock_failed_reason_distribution = _step_distribution("lock_condition_failed_reason")
+        selector_name_counts = _step_value_counts("selector_name")
+        selector_function_name_counts = _step_value_counts("selector_function_name")
+        selection_strategy_name_counts = _step_value_counts("selection_strategy_name")
+        selection_stage_name_counts = _step_value_counts("selection_stage_name")
+        selection_error_counts = _step_value_counts("selection_error")
+        selection_warning_counts = _step_value_counts("selection_warning")
+        valid_3d_token_ratio = _nullable_list_mean(
+            _step_numeric_values("valid_token_ratio") or _step_numeric_values("valid_depth_ratio")
+        )
+
+        # ---- Build summary dict ----
+        summary = {
+            # Identity
+            "model": "OpenVLA",
+            "checkpoint": self.config_dict.get("model_path", "unknown"),
+            "task_suite": self.config_dict.get("task_suite", "unknown"),
+            "num_tasks_evaluated": num_tasks_evaluated,
+            "num_trials_per_task": self.config_dict.get("num_episodes", 1),
+            "num_episodes": n,
+
+            # Overall rates
+            "overall_success_rate": n_success / n if n else 0.0,
+            "overall_failure_rate": n_failure / n if n else 0.0,
+            "overall_timeout_rate": n_timeout / n if n else 0.0,
+            "num_successes": n_success,
+            "num_failures": n_failure,
+
+            # Steps (all)
+            "mean_episode_steps_all": steps_all["mean"],
+            "std_episode_steps_all": steps_all["std"],
+            "min_episode_steps_all": steps_all["min"],
+            "max_episode_steps_all": steps_all["max"],
+            # Steps (success only) â€?Fix 2: null if empty
+            "mean_episode_steps_success_only": steps_success["mean"],
+            "std_episode_steps_success_only": steps_success["std"],
+            # Steps (failure only) â€?Fix 2: null if empty
+            "mean_episode_steps_failure_only": steps_failure["mean"],
+            "std_episode_steps_failure_only": steps_failure["std"],
+
+            # Episode time (all / success / failure) â€?Fix 2: null if empty
+            "mean_episode_time_sec_all": time_all["mean"],
+            "std_episode_time_sec_all": time_all["std"],
+            "mean_episode_time_sec_success_only": time_success["mean"],
+            "mean_episode_time_sec_failure_only": time_failure["mean"],
+
+            # Per-step wall time (Fix 4: two semantics)
+            # Compatibility alias: episode_avg (mean of per-episode means)
+            "mean_step_wall_time_ms": step_wall_episode_avg["mean"],
+            "std_step_wall_time_ms": step_wall_episode_avg["std"],
+            "min_step_wall_time_ms": step_wall_episode_avg["min"],
+            "max_step_wall_time_ms": step_wall_episode_avg["max"],
+            # New: episode_avg (explicit name, same as mean_step_wall_time_ms)
+            "mean_step_wall_time_ms_episode_avg": step_wall_episode_avg["mean"],
+            # New: global (total wall time / total steps)
+            "mean_step_wall_time_ms_global": step_wall_global_mean,
+            "std_step_wall_time_ms_global": step_wall_global_std,
+            "min_step_wall_time_ms_global": step_wall_global_min,
+            "max_step_wall_time_ms_global": step_wall_global_max,
+
+            # Inference timing
+            "mean_model_forward_time_ms": fw_all["mean"],
+            "mean_model_forward_ms": fw_all["mean"],
+            "std_model_forward_time_ms": fw_all["std"],
+            "min_model_forward_time_ms": fw_all["min"],
+            "max_model_forward_time_ms": fw_all["max"],
+            "mean_end_to_end_step_wall_time_ms": step_wall_episode_avg["mean"],
+
+            # Fix 1: null if not timed (NullTimer)
+            "mean_preprocess_time_ms": preprocess_step_stats["mean"],
+            "std_preprocess_time_ms": preprocess_step_stats["std"],
+            "min_preprocess_time_ms": preprocess_step_stats["min"],
+            "max_preprocess_time_ms": preprocess_step_stats["max"],
+            "mean_action_postprocess_time_ms": postprocess_step_stats["mean"],
+            "std_action_postprocess_time_ms": postprocess_step_stats["std"],
+            "min_action_postprocess_time_ms": postprocess_step_stats["min"],
+            "max_action_postprocess_time_ms": postprocess_step_stats["max"],
+
+            # CUDA latency
+            "mean_cuda_latency_ms": cuda_latency_summary["mean"] if cuda_latency_summary else None,
+            "std_cuda_latency_ms": cuda_latency_summary["std"] if cuda_latency_summary else None,
+            "min_cuda_latency_ms": cuda_latency_summary["min"] if cuda_latency_summary else None,
+            "max_cuda_latency_ms": cuda_latency_summary["max"] if cuda_latency_summary else None,
+
+            # Control frequency
+            "control_frequency_hz": control_frequency_hz,
+            "model_only_frequency_hz": model_only_frequency_hz,
+            "cuda_only_frequency_hz": cuda_only_frequency_hz,
+
+            # Sub-module timing (null if not measured)
+            "mean_vision_encoder_time_ms": _nullable_mean("mean_vision_encoder_time_ms"),
+            "mean_projector_time_ms": _nullable_mean("mean_projector_time_ms"),
+            "mean_llm_forward_time_ms": _nullable_mean("mean_llm_forward_time_ms"),
+            "mean_llm_prefill_time_ms": _nullable_mean("mean_llm_prefill_time_ms"),
+            "mean_llm_decode_time_ms": _nullable_mean("mean_llm_decode_time_ms"),
+            "mean_llm_prefill_seq_len": _nullable_mean("mean_llm_prefill_seq_len"),
+            "llm_timing_split_available": any(bool(r.get("llm_timing_split_available")) for r in records),
+            "mean_action_decode_time_ms": _nullable_mean("mean_action_decode_time_ms"),
+            "decode_impl": _first_non_null([r.get("decode_impl") for r in records]),
+            "decode_impl_distribution": _step_distribution("decode_impl"),
+            "decode_runtime_opt": _first_non_null([r.get("decode_runtime_opt") for r in records]),
+            "decode_runtime_opt_distribution": _step_distribution("decode_runtime_opt"),
+            "decode_runtime_opt_effective": _step_first_present("decode_runtime_opt_effective"),
+            "decode_runtime_opt_effective_distribution": _step_distribution("decode_runtime_opt_effective"),
+            "decode_runtime_opt_status": _step_first_present("decode_runtime_opt_status"),
+            "decode_runtime_opt_status_distribution": _step_distribution("decode_runtime_opt_status"),
+            "decode_runtime_opt_error": _step_first_non_empty("decode_runtime_opt_error"),
+            "fixed_shape_decode_enabled": _step_first_non_empty("fixed_shape_decode_enabled"),
+            "fixed_shape_decode_effective": _step_first_non_empty("fixed_shape_decode_effective"),
+            "fixed_shape_decode_fallback_reason": _step_first_non_empty("fixed_shape_decode_fallback_reason"),
+            "fixed_shape_cache_preallocated": _step_first_non_empty("fixed_shape_cache_preallocated"),
+            "fixed_shape_cache_max_len": _step_first_present("fixed_shape_cache_max_len"),
+            "fixed_shape_cache_num_layers": _step_first_present("fixed_shape_cache_num_layers"),
+            "fixed_shape_cache_layout": _step_first_non_empty("fixed_shape_cache_layout"),
+            "fixed_shape_decode_shape_stable": _step_first_non_empty("fixed_shape_decode_shape_stable"),
+            "fixed_shape_decode_used_flash_attn_kvcache": _step_first_non_empty("fixed_shape_decode_used_flash_attn_kvcache"),
+            "decode_cuda_graph_capture_attempted": _step_first_non_empty("decode_cuda_graph_capture_attempted"),
+            "decode_cuda_graph_capture_success": _step_first_non_empty("decode_cuda_graph_capture_success"),
+            "decode_cuda_graph_fallback_reason": _step_first_non_empty("decode_cuda_graph_fallback_reason"),
+            "runtime_opt_fallback_reason": _step_first_non_empty("runtime_opt_fallback_reason"),
+            "mean_hf_generate_total_ms": _nullable_mean("mean_hf_generate_total_ms"),
+            "mean_prefill_forward_ms": _nullable_mean("mean_prefill_forward_ms"),
+            "mean_decode_loop_total_ms": _nullable_mean("mean_decode_loop_total_ms"),
+            "mean_decode_num_tokens": _nullable_mean("mean_decode_num_tokens"),
+            "mean_decode_per_token_ms": _nullable_mean("mean_decode_per_token_ms"),
+            "mean_decode_model_forward_ms": _nullable_mean("mean_decode_model_forward_ms"),
+            "mean_decode_logits_head_ms": _nullable_mean("mean_decode_logits_head_ms"),
+            "mean_decode_postprocess_ms": _nullable_mean("mean_decode_postprocess_ms"),
+            "mean_action_token_cpu_transfer_ms": _nullable_mean("mean_action_token_cpu_transfer_ms"),
+            "mean_decode_compile_setup_ms": _nullable_mean("mean_decode_compile_setup_ms"),
+            "mean_decode_python_overhead_ms": _nullable_mean("mean_decode_python_overhead_ms"),
+            "mean_cuda_sync_count": _nullable_mean("mean_cuda_sync_count"),
+            "mean_implicit_cuda_sync_count": _nullable_mean("mean_implicit_cuda_sync_count"),
+            "decode_timing_scope": _step_first_non_empty("decode_timing_scope"),
+            "decode_correctness_check_enabled": _step_first_non_empty("decode_correctness_check_enabled"),
+            "decode_correctness_check_passed": _step_first_non_empty("decode_correctness_check_passed"),
+            "decode_latency_valid_for_clean_benchmark": _step_first_non_empty("decode_latency_valid_for_clean_benchmark"),
+            "output_hidden_states_effective": _step_first_non_empty("output_hidden_states_effective"),
+            "return_dict_in_generate_effective": _step_first_non_empty("return_dict_in_generate_effective"),
+            "transformers_version": self.config_dict.get("transformers_version") or _step_first_non_empty("transformers_version"),
+            "tokenizers_version": self.config_dict.get("tokenizers_version") or _step_first_non_empty("tokenizers_version"),
+            "torch_version": self.config_dict.get("torch_version") or _step_first_non_empty("torch_version"),
+            "cuda_version": self.config_dict.get("cuda_version") or _step_first_non_empty("cuda_version"),
+            "attn_implementation": self.config_dict.get("attn_implementation") or _step_first_non_empty("attn_implementation"),
+            "runtime_opt_mode": self.config_dict.get("runtime_opt_mode") or _step_first_non_empty("runtime_opt_mode"),
+            "runtime_pruning_enabled": self.config_dict.get("pruning_enabled") if self.config_dict.get("pruning_enabled") is not None else _step_first_non_empty("pruning_enabled"),
+            "runtime_prune_layer": self.config_dict.get("prune_layer") or _step_first_non_empty("prune_layer"),
+            "output_attentions_enabled": self.config_dict.get("output_attentions_enabled"),
+
+            # GPU memory
+            "mean_gpu_memory_mb": round(mem_mean, 1),
+            "max_gpu_memory_mb": round(self._overall_max_gpu_memory_mb, 1),
+            "max_gpu_memory_reserved_mb": round(self._overall_max_gpu_memory_reserved_mb, 1),
+
+            # Action smoothness (Fix 3: step-level max, not episode-mean max)
+            "mean_delta_action": delta_all_step["mean"],
+            "std_delta_action": delta_all_step["std"],
+            "max_delta_action": delta_all_step["max"],
+            "mean_jerk_action": jerk_all_step["mean"],
+            "std_jerk_action": jerk_all_step["std"],
+            "max_jerk_action": jerk_all_step["max"],
+            "total_gripper_changes": gripper_changes,
+
+            # FLOPs
+            "flops_T": flops_T,
+            "flop_ratio": flop_ratio,
+            "flop_reduction_percent": flop_reduction_percent,
+            "flops_estimation_method": flops_estimation_method,
+            "profiler_exact_flops_available": profiler_exact_flops_available,
+            "profiler_exact_flops_mean": profiler_exact_flops_mean,
+            "profiler_exact_flops_std": profiler_exact_flops_std,
+            "profiler_exact_flops_T": flops_T,
+            "profiler_exact_flops_profiled_step_count": profiler_exact_flops_profiled_steps,
+            "profiler_exact_flops_available_step_count": profiler_exact_flops_available_steps,
+            "profiler_exact_flops_events_mean": profiler_exact_flops_events_mean,
+            "profiler_exact_flops_source": _step_first_non_empty("profiler_exact_flops_source"),
+            "profiler_exact_flops_scope": _step_first_non_empty("profiler_exact_flops_scope"),
+            "profiler_trace_profiled_step_count": profiler_trace_profiled_steps,
+            "profiler_trace_cpu_table_path": _step_first_non_empty("profiler_trace_cpu_table_path"),
+            "profiler_trace_cuda_table_path": _step_first_non_empty("profiler_trace_cuda_table_path"),
+            "profiler_trace_chrome_path": _step_first_non_empty("profiler_trace_chrome_path"),
+            "profiler_cuda_launch_kernel_count": _step_first_present("profiler_cuda_launch_kernel_count"),
+            "mean_profiler_cuda_launch_kernel_count": _nullable_list_mean(
+                _step_numeric_values("profiler_cuda_launch_kernel_count")
+            ),
+            "profiler_aten_mm_cuda_time_ms": _step_first_present("profiler_aten_mm_cuda_time_ms"),
+            "mean_profiler_aten_mm_cuda_time_ms": _nullable_list_mean(
+                _step_numeric_values("profiler_aten_mm_cuda_time_ms")
+            ),
+            "profiler_exact_flops_unavailable_reason": (
+                None
+                if profiler_exact_flops_available
+                else "No torch.profiler FLOP sample in step records. Run with --enable_torch_profiler_flops true."
+            ),
+
+            # Token pruning config
+            "pruning_method": pruning_method,
+            "keep_ratio": self.config_dict.get("keep_ratio", 1.0),
+
+            # Geometry and pruning enabled flags
+            "geometry_enabled": self.config_dict.get("geometry_enabled", False),
+            "pruning_enabled": pruning_method != "none",
+
+            # Visual token counts (Fix 6: from step_metrics step-level shape analysis)
+            "num_visual_tokens_original": num_visual_tokens_original,
+            "num_visual_tokens_kept": num_visual_tokens_kept,
+            "num_visual_tokens_pruned": num_visual_tokens_pruned,
+            "num_visual_tokens_per_encoder": num_visual_tokens_per_encoder,
+            "token_retention_ratio": _nullable_list_mean(effective_retention_step_vals) if effective_retention_step_vals else token_retention_ratio,
+            "token_pruning_ratio": (1.0 - _nullable_list_mean(effective_retention_step_vals)) if effective_retention_step_vals else token_pruning_ratio,
+            "raw_projector_token_retention_ratio": token_retention_ratio,
+            "compression_backend_distribution": compression_backend_distribution,
+            "compression_backend": _mode_any([str(r.get("compression_backend")) for r in self._step_records if r.get("compression_backend") not in (None, "")]),
+
+            # Token counts from step accumulators (mean across steps)
+            "num_visual_tokens_original_mean": _safe_mean([
+                v for vals in self._task_vt_original.values() for v in vals
+            ]) if self._task_vt_original else None,
+            "num_visual_tokens_kept_mean": _safe_mean([
+                v for vals in self._task_vt_kept.values() for v in vals
+            ]) if self._task_vt_kept else None,
+            "mean_visual_tokens_kept": _safe_mean([
+                v for vals in self._task_vt_kept.values() for v in vals
+            ]) if self._task_vt_kept else None,
+            "actual_keep_ratio_mean": (
+                _nullable_list_mean(actual_keep_ratio_vals) if pruning_method != "none" else None
+            ),
+            "requested_keep_ratio_mean": _nullable_list_mean(requested_keep_ratio_step_vals),
+            "keep_ratio_source_distribution": keep_ratio_source_distribution,
+            "effective_keep_count_mean": _nullable_list_mean(effective_keep_count_step_vals),
+            "original_token_count_mean": _nullable_list_mean(original_token_count_step_vals),
+            "effective_visual_tokens_for_llm_mean": _nullable_list_mean(effective_visual_tokens_step_vals),
+            "original_visual_tokens_mean": _nullable_list_mean(original_visual_step_vals),
+            "kept_visual_tokens_mean": _nullable_list_mean(kept_visual_step_vals),
+            "pruned_visual_tokens_mean": _nullable_list_mean(pruned_visual_step_vals),
+            "mean_llm_input_seq_len_before_prune": _nullable_list_mean(llm_seq_before_prune_step_vals),
+            "mean_llm_input_seq_len_after_prune": _nullable_list_mean(llm_seq_after_prune_step_vals),
+            "mean_llm_input_seq_len_pruned": _nullable_list_mean(llm_seq_pruned_step_vals),
+            "llm_input_seq_len_before_prune_mean": _nullable_list_mean(llm_seq_before_prune_step_vals),
+            "llm_input_seq_len_after_prune_mean": _nullable_list_mean(llm_seq_after_prune_step_vals),
+            "llm_input_seq_len_pruned_mean": _nullable_list_mean(llm_seq_pruned_step_vals),
+            "effective_retention_mean": _nullable_list_mean(effective_retention_step_vals),
+            "projector_retention_mean": _nullable_list_mean(projector_retention_step_vals),
+            "internal_retention_mean": _nullable_list_mean(internal_retention_step_vals),
+            "mean_internal_original_visual_tokens": _nullable_list_mean(internal_original_visual_step_vals),
+            "mean_internal_kept_visual_tokens": _nullable_list_mean(internal_kept_visual_step_vals),
+            "mean_internal_pruned_visual_tokens": _nullable_list_mean(internal_pruned_visual_step_vals),
+            "mean_internal_original_seq_length": _nullable_list_mean(internal_original_seq_step_vals),
+            "mean_internal_kept_seq_length": _nullable_list_mean(internal_kept_seq_step_vals),
+            "mean_internal_pruned_seq_length": _nullable_list_mean(internal_pruned_seq_step_vals),
+            "mean_internal_total_layers": _nullable_list_mean(internal_total_layers_step_vals),
+            "mean_internal_first_short_layer": _nullable_list_mean(internal_first_short_layer_step_vals),
+            "mean_internal_shortened_layer_count": _nullable_list_mean(internal_shortened_layer_step_vals),
+            "mean_internal_post_prune_layer_count": _nullable_list_mean(internal_post_prune_layer_step_vals),
+            "mean_internal_post_prune_layer_ratio": _nullable_list_mean(internal_post_prune_ratio_step_vals),
+            "mean_internal_kv_cache_short_length_layer_count": _nullable_list_mean(internal_kv_short_layer_step_vals),
+            "mean_internal_kv_cache_token_reduction_ratio": _nullable_list_mean(internal_kv_reduction_step_vals),
+            "mean_internal_kv_cache_mean_seq_len": _nullable_list_mean(internal_kv_mean_len_step_vals),
+            "mean_decode_effective_kv_tokens": _nullable_list_mean(decode_effective_kv_step_vals),
+            "fallback_reason_counts": fallback_reason_counts,
+            # P6: selector path and accounting diagnostics. Nulls are skipped.
+            "selector_name_counts": selector_name_counts,
+            "selector_function_name_counts": selector_function_name_counts,
+            "selection_strategy_name_counts": selection_strategy_name_counts,
+            "selection_stage_name_counts": selection_stage_name_counts,
+            "selector_success_ratio": _step_bool_ratio("selector_success"),
+            "keep_indices_sorted_ratio": _step_bool_ratio("keep_indices_sorted"),
+            "keep_indices_unique_ratio": _step_bool_ratio("keep_indices_unique"),
+            "keep_indices_out_of_bounds_ratio": _step_bool_ratio("keep_indices_out_of_bounds"),
+            "selection_error_counts": selection_error_counts,
+            "selection_warning_counts": selection_warning_counts,
+            "keep_ratio_requested_mean": _nullable_list_mean(_step_numeric_values("keep_ratio_requested")),
+            "keep_ratio_actual_mean": _nullable_list_mean(_step_numeric_values("keep_ratio_actual")),
+            "retention_actual_mean": _nullable_list_mean(_step_numeric_values("retention_actual")),
+            "num_visual_tokens_dropped_mean": _nullable_list_mean(_step_numeric_values("num_visual_tokens_dropped")),
+            "num_visual_tokens_original_total_mean": _nullable_list_mean(_step_numeric_values("num_visual_tokens_original_total")),
+            "num_visual_tokens_kept_total_mean": _nullable_list_mean(_step_numeric_values("num_visual_tokens_kept_total")),
+            "selected_by_phase1_mean": _nullable_list_mean(_step_numeric_values("selected_by_phase1")),
+            "selected_by_phase2_mean": _nullable_list_mean(_step_numeric_values("selected_by_phase2")),
+            "selected_by_phase3_mean": _nullable_list_mean(_step_numeric_values("selected_by_phase3")),
+            "selected_by_fill_mean": _nullable_list_mean(_step_numeric_values("selected_by_fill")),
+            "selected_by_fallback_mean": _nullable_list_mean(_step_numeric_values("selected_by_fallback")),
+            "selected_unattributed_mean": _nullable_list_mean(_step_numeric_values("selected_unattributed")),
+            "phase_accounting_valid_ratio": _step_bool_ratio("phase_accounting_valid"),
+            "phase_accounting_error_counts": _step_value_counts("phase_accounting_error"),
+            "reserved_edge_dropped_ratio_mean": _nullable_list_mean(_step_numeric_values("reserved_edge_dropped_ratio")),
+            "non_reserved_topk_count_mean": _nullable_list_mean(_step_numeric_values("non_reserved_topk_count")),
+            "non_reserved_kept_count_mean": _nullable_list_mean(_step_numeric_values("non_reserved_kept_count")),
+            "non_reserved_dropped_count_mean": _nullable_list_mean(_step_numeric_values("non_reserved_dropped_count")),
+            "non_reserved_dropped_ratio_mean": _nullable_list_mean(_step_numeric_values("non_reserved_dropped_ratio")),
+            "total_keep_budget_mean": _nullable_list_mean(_step_numeric_values("total_keep_budget")),
+            "depth_edge_budget_mean": _nullable_list_mean(_step_numeric_values("depth_edge_budget")),
+            "robot_geo_budget_mean": _nullable_list_mean(_step_numeric_values("robot_geo_budget")),
+            "fill_budget_mean": _nullable_list_mean(_step_numeric_values("fill_budget")),
+            "safety_budget_mean": _nullable_list_mean(_step_numeric_values("safety_budget")),
+            "score_min_mean": _nullable_list_mean(_step_numeric_values("score_min")),
+            "score_max_mean": _nullable_list_mean(_step_numeric_values("score_max")),
+            "score_mean_mean": _nullable_list_mean(_step_numeric_values("score_mean")),
+            "score_std_mean": _nullable_list_mean(_step_numeric_values("score_std")),
+            # P7: hybrid_budget_v2 aggregates
+            "hybrid_budget_v2_ratio": _safe_mean([1 if v else 0 for v in _step_numeric_values("hybrid_budget_v2")]) if _step_numeric_values("hybrid_budget_v2") else None,
+            "mean_depth_edge_budget_ratio": _nullable_list_mean(_step_numeric_values("depth_edge_budget_ratio")),
+            "mean_robot_contact_budget_ratio": _nullable_list_mean(_step_numeric_values("robot_contact_budget_ratio")),
+            "mean_safety_budget_ratio": _nullable_list_mean(_step_numeric_values("safety_budget_ratio")),
+            "mean_K_depth_actual": _nullable_list_mean(_step_numeric_values("K_depth_actual")),
+            "mean_K_robot_actual": _nullable_list_mean(_step_numeric_values("K_robot_actual")),
+            "mean_K_fill_actual": _nullable_list_mean(_step_numeric_values("K_fill_actual")),
+            "mean_overlap_depth_robot_count": _nullable_list_mean(_step_numeric_values("overlap_depth_robot_count")),
+            "mean_overlap_depth_robot_diagnostic": _nullable_list_mean(_step_numeric_values("overlap_depth_robot_diagnostic")),
+            "mean_depth_edge_candidates_count": _nullable_list_mean(_step_numeric_values("depth_edge_candidates_count")),
+            "mean_robot_geo_candidates_count": _nullable_list_mean(_step_numeric_values("robot_geo_candidates_count")),
+            "mean_fill_from_depth_count": _nullable_list_mean(_step_numeric_values("fill_from_depth_count")),
+            "mean_fill_from_robot_count": _nullable_list_mean(_step_numeric_values("fill_from_robot_count")),
+            "mean_fill_from_other_count": _nullable_list_mean(_step_numeric_values("fill_from_other_count")),
+            # Hybrid v1 / temporal aggregations (from step-level records)
+            "mean_hook_overhead_ms": _safe_mean(hook_overhead_vals) if hook_overhead_vals else None,
+            "max_hook_overhead_ms": max(hook_overhead_vals) if hook_overhead_vals else None,
+            "hybrid_score_mean": _safe_mean(hybrid_score_vals) if hybrid_score_vals else None,
+            "edge_score_mean": _safe_mean(edge_score_vals) if edge_score_vals else None,
+            "interaction_lock_ratio": interaction_lock_count / step_count if step_count > 0 else None,
+            "ema_used_for_selection_ratio": ema_used_count / step_count if step_count > 0 else None,
+            "score_ema_available_ratio": score_ema_available_ratio,
+            "lock_condition_failed_reason_distribution": lock_failed_reason_distribution,
+            "adaptive_threshold_mean": _safe_mean(adaptive_th_vals) if adaptive_th_vals else None,
+
+            # Geometry timing (from step accumulators)
+            "mean_token_mapping_time_ms": _safe_mean([
+                v for vals in self._task_token_mapping_times.values() for v in vals
+            ]) if self._task_token_mapping_times else None,
+            "mean_geometry_score_time_ms": _safe_mean([
+                v for vals in self._task_geometry_score_times.values() for v in vals
+            ]) if self._task_geometry_score_times else None,
+            "mean_pruning_time_ms": _safe_mean([
+                v for vals in self._task_pruning_times.values() for v in vals
+            ]) if self._task_pruning_times else None,
+            "mean_depth_fetch_ms": _safe_mean([
+                v for vals in self._task_depth_fetch_times.values() for v in vals
+            ]) if self._task_depth_fetch_times else None,
+            "mean_depth_sample_ms": _safe_mean([
+                v for vals in self._task_depth_sample_times.values() for v in vals
+            ]) if self._task_depth_sample_times else None,
+            "mean_depth_edge_score_ms": _safe_mean([
+                v for vals in self._task_depth_edge_score_times.values() for v in vals
+            ]) if self._task_depth_edge_score_times else None,
+            "mean_token_xyz_projection_ms": _safe_mean([
+                v for vals in self._task_token_xyz_projection_times.values() for v in vals
+            ]) if self._task_token_xyz_projection_times else None,
+            "mean_score_fusion_ms": _safe_mean([
+                v for vals in self._task_score_fusion_times.values() for v in vals
+            ]) if self._task_score_fusion_times else None,
+            "mean_depth_sampling_ms": _safe_mean([
+                v for vals in self._task_depth_sampling_times.values() for v in vals
+            ]) if self._task_depth_sampling_times else None,
+            "mean_score_compute_ms": _safe_mean([
+                v for vals in self._task_score_compute_times.values() for v in vals
+            ]) if self._task_score_compute_times else None,
+            "mean_selection_ms": _safe_mean([
+                v for vals in self._task_selection_times.values() for v in vals
+            ]) if self._task_selection_times else None,
+            "mean_gather_ms": _safe_mean([
+                v for vals in self._task_gather_times.values() for v in vals
+            ]) if self._task_gather_times else None,
+            "mean_edge_score_ms": _safe_mean([
+                v for vals in self._task_edge_score_times.values() for v in vals
+            ]) if self._task_edge_score_times else None,
+            "mean_robot_mapping_ms": _safe_mean([
+                v for vals in self._task_robot_mapping_times.values() for v in vals
+            ]) if self._task_robot_mapping_times else None,
+            "mean_near_score_ms": _safe_mean([
+                v for vals in self._task_near_score_times.values() for v in vals
+            ]) if self._task_near_score_times else None,
+            "mean_corridor_score_ms": _safe_mean([
+                v for vals in self._task_corridor_score_times.values() for v in vals
+            ]) if self._task_corridor_score_times else None,
+            "mean_contact_score_ms": _safe_mean([
+                v for vals in self._task_contact_score_times.values() for v in vals
+            ]) if self._task_contact_score_times else None,
+            "mean_edge_selection_ms": _safe_mean([
+                v for vals in self._task_edge_selection_times.values() for v in vals
+            ]) if self._task_edge_selection_times else None,
+            "mean_geo_selection_ms": _safe_mean([
+                v for vals in self._task_geo_selection_times.values() for v in vals
+            ]) if self._task_geo_selection_times else None,
+            "mean_diverse_selection_ms": _safe_mean([
+                v for vals in self._task_diverse_selection_times.values() for v in vals
+            ]) if self._task_diverse_selection_times else None,
+            "mean_final_merge_ms": _safe_mean([
+                v for vals in self._task_final_merge_times.values() for v in vals
+            ]) if self._task_final_merge_times else None,
+            "mean_topk_pruning_ms": _safe_mean([
+                v for vals in self._task_topk_pruning_times.values() for v in vals
+            ]) if self._task_topk_pruning_times else None,
+            "mean_hook_total_ms": _safe_mean([
+                v for vals in self._task_hook_total_times.values() for v in vals
+            ]) if self._task_hook_total_times else None,
+            "mean_hook_total_ms_excluding_warmup": _safe_mean([
+                v for vals in self._task_hook_total_times_excluding_warmup.values() for v in vals
+            ]) if self._task_hook_total_times_excluding_warmup else None,
+            "p50_hook_total_ms": float(np.percentile([
+                v for vals in self._task_hook_total_times.values() for v in vals
+            ], 50)) if self._task_hook_total_times else None,
+            "p95_hook_total_ms": float(np.percentile([
+                v for vals in self._task_hook_total_times.values() for v in vals
+            ], 95)) if self._task_hook_total_times else None,
+            "max_hook_total_ms": max([
+                v for vals in self._task_hook_total_times.values() for v in vals
+            ]) if self._task_hook_total_times else None,
+            "mean_geometry_total_time_ms": _safe_mean([
+                v for vals in self._task_geometry_total_times.values() for v in vals
+            ]) if self._task_geometry_total_times else None,
+
+            # Geometry score statistics (from step accumulators)
+            "geometry_score_mean": _safe_mean([
+                v for vals in self._task_geometry_score_means.values() for v in vals
+            ]) if self._task_geometry_score_means else None,
+            "geometry_score_max": max([
+                v for vals in self._task_geometry_score_maxes.values() for v in vals
+            ]) if self._task_geometry_score_maxes else None,
+            "geometry_score_std": _safe_mean([
+                v for vals in self._task_geometry_score_stds.values() for v in vals
+            ]) if self._task_geometry_score_stds else None,
+            "distance_score_mean": _safe_mean([
+                v for vals in self._task_distance_score_means.values() for v in vals
+            ]) if self._task_distance_score_means else None,
+            "direction_score_mean": _safe_mean([
+                v for vals in self._task_direction_score_means.values() for v in vals
+            ]) if self._task_direction_score_means else None,
+            "depth_edge_score_mean": _safe_mean([
+                v for vals in self._task_depth_edge_score_means.values() for v in vals
+            ]) if self._task_depth_edge_score_means else None,
+            "valid_token_ratio_mean": _safe_mean([
+                v for vals in self._task_valid_token_ratios.values() for v in vals
+            ]) if self._task_valid_token_ratios else None,
+            "d_min": _safe_mean([
+                v for vals in self._task_d_mins.values() for v in vals
+            ]) if self._task_d_mins else None,
+            "d_mean_topk": _safe_mean([
+                v for vals in self._task_d_mean_topks.values() for v in vals
+            ]) if self._task_d_mean_topks else None,
+            "mean_near_score": _safe_mean([
+                v for vals in self._task_mean_near_scores.values() for v in vals
+            ]) if self._task_mean_near_scores else None,
+            "max_near_score": max([
+                v for vals in self._task_max_near_scores.values() for v in vals
+            ]) if self._task_max_near_scores else None,
+            "motion_norm": _safe_mean([
+                v for vals in self._task_motion_norms.values() for v in vals
+            ]) if self._task_motion_norms else None,
+            "corridor_strength_mean": _safe_mean([
+                v for vals in self._task_corridor_strength_means.values() for v in vals
+            ]) if self._task_corridor_strength_means else None,
+            "corridor_strength_topk_mean": _safe_mean([
+                v for vals in self._task_corridor_strength_topk_means.values() for v in vals
+            ]) if self._task_corridor_strength_topk_means else None,
+            "d_corridor_min": _safe_mean([
+                v for vals in self._task_d_corridor_mins.values() for v in vals
+            ]) if self._task_d_corridor_mins else None,
+            "d_corridor_mean_topk": _safe_mean([
+                v for vals in self._task_d_corridor_mean_topks.values() for v in vals
+            ]) if self._task_d_corridor_mean_topks else None,
+            "mean_keep_ratio": _safe_mean([
+                v for vals in self._task_dynamic_keep_ratios.values() for v in vals
+            ]) if self._task_dynamic_keep_ratios else None,
+            "dynamic_keep_ratio_mean": _nullable_list_mean(dynamic_keep_ratio_step_vals),
+            "dynamic_keep_ratio_std": _nullable_list_std(dynamic_keep_ratio_step_vals),
+            "mean_keep_k": _safe_mean([
+                v for vals in self._task_dynamic_keep_ks.values() for v in vals
+            ]) if self._task_dynamic_keep_ks else None,
+            "d_topk_mean": _safe_mean([
+                v for vals in self._task_d_topk_means.values() for v in vals
+            ]) if self._task_d_topk_means else None,
+            "corridor_strength": _safe_mean([
+                v for vals in self._task_corridor_strengths.values() for v in vals
+            ]) if self._task_corridor_strengths else None,
+            "edge_concentration": _safe_mean([
+                v for vals in self._task_edge_concentrations.values() for v in vals
+            ]) if self._task_edge_concentrations else None,
+            "valid_depth_ratio": _safe_mean([
+                v for vals in self._task_valid_depth_ratios.values() for v in vals
+            ]) if self._task_valid_depth_ratios else None,
+            "phase_ratio_far": (global_phase_counts.get("far", 0) / global_phase_total) if global_phase_total else None,
+            "phase_ratio_mid": (global_phase_counts.get("mid", 0) / global_phase_total) if global_phase_total else None,
+            "phase_ratio_near": (global_phase_counts.get("near", 0) / global_phase_total) if global_phase_total else None,
+            "phase_ratio_fallback_safe": (global_phase_counts.get("fallback_safe", 0) / global_phase_total) if global_phase_total else None,
+            "geo_risk_level_distribution": geo_risk_distribution,
+            "interaction_lock_ratio": interaction_lock_ratio,
+            "valid_3d_token_ratio": valid_3d_token_ratio,
+            "fallback_ratio": fallback_ratio,
+            "mean_K_edge_actual": _safe_mean([
+                v for vals in self._task_K_edge_actuals.values() for v in vals
+            ]) if self._task_K_edge_actuals else None,
+            "mean_K_geo_actual": _safe_mean([
+                v for vals in self._task_K_geo_actuals.values() for v in vals
+            ]) if self._task_K_geo_actuals else None,
+            "mean_K_diverse_actual": _safe_mean([
+                v for vals in self._task_K_diverse_actuals.values() for v in vals
+            ]) if self._task_K_diverse_actuals else None,
+            "mean_geo_contact_score_topk": _safe_mean([
+                v for vals in self._task_geo_contact_score_topks.values() for v in vals
+            ]) if self._task_geo_contact_score_topks else None,
+            "mean_near_contact_score_topk": _safe_mean([
+                v for vals in self._task_near_contact_score_topks.values() for v in vals
+            ]) if self._task_near_contact_score_topks else None,
+            "mean_corridor_contact_score_topk": _safe_mean([
+                v for vals in self._task_corridor_contact_score_topks.values() for v in vals
+            ]) if self._task_corridor_contact_score_topks else None,
+
+            # New diagnostic rollup fields
+            "interaction_lock_ratio": _step_bool_ratio("interaction_lock"),
+            "valid_3d_token_ratio": _nullable_list_mean(
+                _step_numeric_values("valid_token_ratio") or _step_numeric_values("valid_depth_ratio")
+            ),
+            "fallback_ratio": _step_bool_ratio("fallback_used"),
+            "action_has_nan_ratio": _safe_mean([
+                1.0 if v else 0.0
+                for vals in self._task_action_has_nan.values()
+                for v in vals
+            ]) if self._task_action_has_nan else None,
+            "action_has_inf_ratio": _safe_mean([
+                1.0 if v else 0.0
+                for vals in self._task_action_has_inf.values()
+                for v in vals
+            ]) if self._task_action_has_inf else None,
+            "action_min": _safe_mean([
+                v for vals in self._task_action_min.values() for v in vals
+            ]) if self._task_action_min else None,
+            "action_max": _safe_mean([
+                v for vals in self._task_action_max.values() for v in vals
+            ]) if self._task_action_max else None,
+            "depth_valid_ratio": _safe_mean([
+                v for vals in self._task_depth_valid_ratio.values() for v in vals
+            ]) if self._task_depth_valid_ratio else None,
+            "distance_to_gripper_min": _safe_mean([
+                v for vals in self._task_dist_gripper_min.values() for v in vals
+            ]) if self._task_dist_gripper_min else None,
+            "distance_to_gripper_mean": _safe_mean([
+                v for vals in self._task_dist_gripper_mean.values() for v in vals
+            ]) if self._task_dist_gripper_mean else None,
+            "distance_to_gripper_max": _safe_mean([
+                v for vals in self._task_dist_gripper_max.values() for v in vals
+            ]) if self._task_dist_gripper_max else None,
+            "robot_state_valid_ratio": _safe_mean([
+                1.0 if v else 0.0
+                for vals in self._task_robot_state_valid.values()
+                for v in vals
+            ]) if self._task_robot_state_valid else None,
+            "motion_direction_valid_ratio": _safe_mean([
+                1.0 if v else 0.0
+                for vals in self._task_motion_direction_valid.values()
+                for v in vals
+            ]) if self._task_motion_direction_valid else None,
+            "action_mean": _safe_mean([
+                v for vals in self._task_action_mean.values() for v in vals
+            ]) if self._task_action_mean else None,
+            "action_std": _safe_mean([
+                v for vals in self._task_action_std.values() for v in vals
+            ]) if self._task_action_std else None,
+            "contact_risk_lock_ratio": _safe_mean([
+                1.0 if v else 0.0
+                for vals in self._task_contact_risk_lock.values()
+                for v in vals
+            ]) if self._task_contact_risk_lock else None,
+            "gripper_proximity_lock_ratio": _safe_mean([
+                1.0 if v else 0.0
+                for vals in self._task_gripper_proximity_lock.values()
+                for v in vals
+            ]) if self._task_gripper_proximity_lock else None,
+            "region_stability_lock_ratio": _safe_mean([
+                1.0 if v else 0.0
+                for vals in self._task_region_stability_lock.values()
+                for v in vals
+            ]) if self._task_region_stability_lock else None,
+            # P0: Depth conversion metadata (mode for categoricals, mean for numerics)
+            "depth_source_key": _mode_any([
+                v for vals in self._task_depth_source_key.values() for v in vals
+            ]) if self._task_depth_source_key else None,
+            "depth_conversion": _mode_any([
+                v for vals in self._task_depth_conversion.values() for v in vals
+            ]) if self._task_depth_conversion else None,
+            "depth_is_metric": _mode_any([
+                v for vals in self._task_depth_is_metric.values() for v in vals
+            ]) if self._task_depth_is_metric else None,
+            "depth_unit": _mode_any([
+                v for vals in self._task_depth_unit.values() for v in vals
+            ]) if self._task_depth_unit else None,
+            "depth_sim_available": _mode_any([
+                v for vals in self._task_depth_sim_available.values() for v in vals
+            ]) if self._task_depth_sim_available else None,
+            "depth_raw_min": _safe_mean([
+                v for vals in self._task_depth_raw_min.values() for v in vals
+            ]) if self._task_depth_raw_min else None,
+            "depth_raw_max": _safe_mean([
+                v for vals in self._task_depth_raw_max.values() for v in vals
+            ]) if self._task_depth_raw_max else None,
+            "depth_raw_mean": _safe_mean([
+                v for vals in self._task_depth_raw_mean.values() for v in vals
+            ]) if self._task_depth_raw_mean else None,
+            "depth_raw_std": _safe_mean([
+                v for vals in self._task_depth_raw_std.values() for v in vals
+            ]) if self._task_depth_raw_std else None,
+            "depth_metric_min": _safe_mean([
+                v for vals in self._task_depth_metric_min.values() for v in vals
+            ]) if self._task_depth_metric_min else None,
+            "depth_metric_max": _safe_mean([
+                v for vals in self._task_depth_metric_max.values() for v in vals
+            ]) if self._task_depth_metric_max else None,
+            "depth_metric_mean": _safe_mean([
+                v for vals in self._task_depth_metric_mean.values() for v in vals
+            ]) if self._task_depth_metric_mean else None,
+            "depth_metric_std": _safe_mean([
+                v for vals in self._task_depth_metric_std.values() for v in vals
+            ]) if self._task_depth_metric_std else None,
+            # Transform convention (P0-4: T_robot_cam_forward)
+            "transform_convention": _mode_any([
+                v for vals in self._task_transform_convention.values() for v in vals
+            ]) if self._task_transform_convention else None,
+            "transform_inverse_used": _mode_any([
+                v for vals in self._task_transform_inverse_used.values() for v in vals
+            ]) if self._task_transform_inverse_used else None,
+            "transform_source": _mode_any([
+                v for vals in self._task_transform_source.values() for v in vals
+            ]) if self._task_transform_source else None,
+            "transform_convention_verified": _mode_any([
+                v for vals in self._task_transform_verified.values() for v in vals
+            ]) if self._task_transform_verified else None,
+            "transform_convention_evidence": _first_non_null([
+                v for vals in self._task_transform_evidence.values() for v in vals
+            ]) if self._task_transform_evidence else None,
+
+            # Speedup / preservation (baseline = 1.0 / 100.0)
+            "speedup": speedup,
+            "speedup_model_forward": speedup_model_forward,
+            "speedup_step_wall": speedup_step_wall,
+            "speedup_cuda": speedup_cuda,
+            "latency_reduction_percent": latency_reduction_percent,
+            "relative_success_rate": relative_success_rate,
+            "performance_preservation_ratio": performance_preservation_ratio,
+            "success_drop_percent": success_drop_percent,
+
+            # Token pruning extension fields (null for baseline)
+            "geometry_expert_time_ms": None,
+            "token_scoring_time_ms": None,
+            "mask_apply_time_ms": None,
+            "pruning_overhead_time_ms": None,
+            "effective_model_forward_time_ms": None,
+
+            # P11: branch_budget_v0 (episode-level step aggregates; step-level rollup is in rollup_pruning_results.py)
+            "branch_budget_v0": None,
+            "branch_accounting_valid": None,
+            "branch_sum_equals_kept": None,
+            "selected_by_depth_branch_count": None,
+            "selected_by_hybrid_branch_count": None,
+            "selected_by_fill_branch_count": None,
+            "overlap_depth_edge_hybrid_count": None,
+            "overlap_depth_edge_hybrid_ratio": None,
+            "non_reserved_depth_edge_dropped_ratio": None,
+            "depth_edge_topk_kept_by_depth_branch_count": None,
+            "depth_edge_topk_kept_by_hybrid_branch_count": None,
+            "depth_edge_topk_kept_by_fill_branch_count": None,
+            "hybrid_final_score_topk_kept_by_depth_branch_count": None,
+            "hybrid_final_score_topk_kept_by_hybrid_branch_count": None,
+            "hybrid_final_score_topk_kept_by_fill_branch_count": None,
+            # P11.3: Legacy hybrid top-k aliases (P8 compat)
+            "hybrid_topk_kept_by_depth_branch_count": None,
+            "hybrid_topk_kept_by_hybrid_branch_count": None,
+            "hybrid_topk_kept_by_fill_branch_count": None,
+            "hybrid_topk_kept_by_fallback_count": None,
+            "hybrid_topk_survival_ratio": None,
+            "hybrid_final_score_topk_count": None,
+            "hybrid_final_score_topk_kept_count": None,
+            "hybrid_final_score_topk_dropped_count": None,
+            "hybrid_final_score_topk_dropped_ratio": None,
+
+            # Per-task breakdown
+            "per_task": per_task_summary,
+        }
+
+        return summary

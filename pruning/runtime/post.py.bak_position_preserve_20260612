@@ -1,0 +1,226 @@
+"""Post-pruning state manager."""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Optional, Tuple
+
+import numpy as np
+import torch
+
+from ..internal.backend import ACGTPInternalPruningBackend, InternalPruningPlan
+from ..core.metrics import HookMetrics
+
+
+class PostPruningStateManager:
+    """Prepare position ids and pruning metadata for the language model."""
+
+    def __init__(
+        self,
+        *,
+        config: Any,
+        update_stats: Optional[Callable[..., None]] = None,
+    ) -> None:
+        self.config = config
+        self._update_stats = update_stats
+        self._pending_position_info: Optional[Dict[str, Any]] = None
+        self._active_position_state: Optional[Dict[str, Any]] = None
+
+    def reset(self) -> None:
+        self._pending_position_info = None
+        self._active_position_state = None
+
+    def _record(self, **updates: Any) -> None:
+        if self._update_stats is not None:
+            self._update_stats(**updates)
+
+    def clear_pending_position_info(self, reason: str) -> None:
+        self.reset()
+        self._record(
+            position_preserve_applied=False,
+            position_preserve_reason=reason,
+        )
+
+    def prepare_position_preserve_info(
+        self,
+        *,
+        keep_indices_np: np.ndarray,
+        num_tokens: int,
+        metrics: HookMetrics,
+    ) -> None:
+        enabled = bool(getattr(self.config, "acgtp_position_preserve_enabled", True))
+        idx = np.asarray(keep_indices_np, dtype=np.int64).reshape(-1)
+        idx = np.sort(np.unique(idx[(idx >= 0) & (idx < int(num_tokens))]))
+        kept = int(idx.size)
+        pruned = int(num_tokens) - kept
+        metrics.position_preserve_enabled = enabled
+        metrics.position_preserve_original_visual_tokens = int(num_tokens)
+        metrics.position_preserve_kept_visual_tokens = kept
+        metrics.pruning_info_recorded = bool(enabled and pruned > 0)
+        metrics.pruning_info_kept_indices_count = kept
+        metrics.pruning_info_pruned_indices_count = max(0, pruned)
+        if not enabled:
+            self.clear_pending_position_info("disabled")
+            metrics.position_preserve_applied = False
+            metrics.position_preserve_reason = "disabled"
+            return
+        if pruned <= 0:
+            self.clear_pending_position_info("no_visual_tokens_pruned")
+            metrics.position_preserve_applied = False
+            metrics.position_preserve_reason = "no_visual_tokens_pruned"
+            return
+
+        pruned_visual = np.setdiff1d(np.arange(int(num_tokens), dtype=np.int64), idx, assume_unique=True)
+        self._pending_position_info = {
+            "keep_indices": idx.copy(),
+            "pruned_visual_indices": pruned_visual,
+            "original_visual_tokens": int(num_tokens),
+            "kept_visual_tokens": kept,
+            "pruned_visual_tokens": int(pruned_visual.size),
+        }
+        metrics.position_preserve_applied = False
+        metrics.position_preserve_reason = "pending_language_model_pre_hook"
+
+    def prepare_internal_pruning_plan(
+        self,
+        *,
+        backend: Optional[ACGTPInternalPruningBackend],
+        keep_indices_np: np.ndarray,
+        num_tokens: int,
+        metrics: HookMetrics,
+        selection_meta: Optional[Dict[str, Any]] = None,
+        source: str = "acgtp",
+        geometry_payload: Optional[Dict[str, Any]] = None,
+        target_keep_ratio: Optional[float] = None,
+        quota_config: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Hand ACGTP geometry payload to the LLM-internal backend."""
+
+        idx = np.asarray(keep_indices_np, dtype=np.int64).reshape(-1)
+        idx = np.sort(np.unique(idx[(idx >= 0) & (idx < int(num_tokens))]))
+        kept = int(idx.size)
+        pruned = int(num_tokens) - kept
+        metrics.compression_backend = "internal"
+        metrics.projector_pruning_applied = False
+        metrics.internal_pruning_requested = True
+        metrics.internal_pruning_plan_ready = backend is not None
+        metrics.internal_pruning_applied = False
+        metrics.internal_original_visual_tokens = int(num_tokens)
+        metrics.internal_kept_visual_tokens = kept
+        metrics.internal_pruned_visual_tokens = max(0, pruned)
+        metrics.internal_pruning_layer = int(getattr(self.config, "acgtp_internal_prune_layer", 2))
+        metrics.position_preserve_enabled = False
+        metrics.position_preserve_applied = False
+        metrics.position_preserve_reason = "internal_backend_plan_only"
+        metrics.pruning_info_recorded = bool(backend is not None)
+        metrics.pruning_info_kept_indices_count = kept
+        metrics.pruning_info_pruned_indices_count = max(0, pruned)
+        self.reset()
+        if backend is None:
+            metrics.internal_pruning_disabled_reason = "internal_backend_unavailable"
+            return
+        plan = InternalPruningPlan.from_visual_keep_indices(
+            idx,
+            original_visual_tokens=int(num_tokens),
+            prune_layer=int(getattr(self.config, "acgtp_internal_prune_layer", 2)),
+            image_token_start_index=1,
+            source=source,
+            selector_metadata=dict(selection_meta or {}),
+            geometry_payload=dict(geometry_payload or {}),
+            target_keep_ratio=target_keep_ratio,
+            quota_config=dict(quota_config or {}),
+        )
+        backend.set_pending_plan(plan)
+
+    def language_model_pre_hook(self, module: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
+        info = self._pending_position_info
+        if info is not None:
+            inputs_embeds = kwargs.get("inputs_embeds")
+            if inputs_embeds is None or not torch.is_tensor(inputs_embeds) or inputs_embeds.ndim != 3:
+                self.clear_pending_position_info("prefill_inputs_embeds_unavailable")
+                return args, kwargs
+            keep_np = np.asarray(info.get("keep_indices"), dtype=np.int64).reshape(-1)
+            original_visual = int(info.get("original_visual_tokens", keep_np.size))
+            kept_visual = int(info.get("kept_visual_tokens", keep_np.size))
+            seq_len = int(inputs_embeds.shape[1])
+            text_tokens = seq_len - 1 - kept_visual
+            if text_tokens < 0 or kept_visual != int(keep_np.size):
+                self.clear_pending_position_info("prefill_sequence_shape_mismatch")
+                return args, kwargs
+            device = inputs_embeds.device
+            keep = torch.as_tensor(keep_np, dtype=torch.long, device=device)
+            bos_pos = torch.zeros(1, dtype=torch.long, device=device)
+            visual_pos = keep + 1
+            text_pos = torch.arange(
+                original_visual + 1,
+                original_visual + 1 + text_tokens,
+                dtype=torch.long,
+                device=device,
+            )
+            pos_1d = torch.cat((bos_pos, visual_pos, text_pos), dim=0)
+            if int(pos_1d.numel()) != seq_len:
+                self.clear_pending_position_info("position_id_length_mismatch")
+                return args, kwargs
+            kwargs["position_ids"] = pos_1d.unsqueeze(0).expand(int(inputs_embeds.shape[0]), -1).contiguous()
+            original_seq_len = int(original_visual + 1 + text_tokens)
+            pruned_visual_pos = torch.as_tensor(
+                np.asarray(info.get("pruned_visual_indices"), dtype=np.int64).reshape(-1) + 1,
+                dtype=torch.long,
+                device=device,
+            )
+            pruning_info = {
+                "original_seq_length": original_seq_len,
+                "compressed_seq_length": seq_len,
+                "pruned_indices": pruned_visual_pos,
+                "kept_indices": pos_1d.detach(),
+                "visual_keep_indices": keep.detach(),
+                "pruning_layer": "projector",
+                "image_token_start_index": 1,
+                "image_token_length": original_visual,
+            }
+            setattr(module, "acgtp_pruning_info", pruning_info)
+            self._active_position_state = {
+                "next_position": original_seq_len,
+                "decode_tokens": 0,
+                "original_seq_length": original_seq_len,
+                "compressed_seq_length": seq_len,
+            }
+            self._pending_position_info = None
+            self._record(
+                position_preserve_enabled=True,
+                position_preserve_applied=True,
+                position_preserve_reason="prefill_position_ids_preserved",
+                position_preserve_original_visual_tokens=original_visual,
+                position_preserve_kept_visual_tokens=kept_visual,
+                position_preserve_text_tokens=text_tokens,
+                position_preserve_prefill_seq_len=seq_len,
+                position_preserve_original_seq_len=original_seq_len,
+                position_preserve_max_position_id=int(pos_1d.max().item()) if pos_1d.numel() else None,
+                position_preserve_decode_tokens=0,
+                pruning_info_recorded=True,
+                pruning_info_kept_indices_count=int(pos_1d.numel()),
+                pruning_info_pruned_indices_count=int(pruned_visual_pos.numel()),
+            )
+            return args, kwargs
+
+        state = self._active_position_state
+        if state is None:
+            return args, kwargs
+        if kwargs.get("position_ids") is not None:
+            return args, kwargs
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None or not torch.is_tensor(input_ids) or input_ids.ndim < 2:
+            return args, kwargs
+        length = int(input_ids.shape[-1])
+        if length <= 0:
+            return args, kwargs
+        start = int(state.get("next_position", state.get("original_seq_length", 0)))
+        device = input_ids.device
+        pos = torch.arange(start, start + length, dtype=torch.long, device=device)
+        kwargs["position_ids"] = pos.unsqueeze(0).expand(int(input_ids.shape[0]), -1).contiguous()
+        state["next_position"] = start + length
+        state["decode_tokens"] = int(state.get("decode_tokens", 0)) + length
+        self._record(
+            position_preserve_decode_tokens=int(state["decode_tokens"]),
+            position_preserve_max_position_id=int(pos[-1].item()) if pos.numel() else None,
+        )
+        return args, kwargs

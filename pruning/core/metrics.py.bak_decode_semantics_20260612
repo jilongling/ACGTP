@@ -1,0 +1,1482 @@
+"""Hook metrics dataclasses and timing fields."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, Optional
+
+
+@dataclass
+class HookTiming:
+    hook_total_ms: Optional[float] = None
+    token_mapping_ms: Optional[float] = None
+    depth_sampling_ms: Optional[float] = None
+    score_compute_ms: Optional[float] = None
+    selection_ms: Optional[float] = None
+    gather_ms: Optional[float] = None
+    edge_score_ms: Optional[float] = None
+    robot_mapping_ms: Optional[float] = None
+    near_score_ms: Optional[float] = None
+    corridor_score_ms: Optional[float] = None
+    contact_score_ms: Optional[float] = None
+    edge_selection_ms: Optional[float] = None
+    geo_selection_ms: Optional[float] = None
+    diverse_selection_ms: Optional[float] = None
+    final_merge_ms: Optional[float] = None
+
+    # Compatibility aliases used by existing summary code.
+    depth_sample_ms: Optional[float] = None
+    depth_edge_score_ms: Optional[float] = None
+    depth_fetch_ms: Optional[float] = None
+    token_xyz_projection_ms: Optional[float] = None
+    score_fusion_ms: Optional[float] = None
+    pruning_time_ms: Optional[float] = None
+    topk_pruning_ms: Optional[float] = None
+
+
+@dataclass
+class HookMetrics:
+    num_visual_tokens_original: Optional[int] = None
+    num_visual_tokens_kept: Optional[int] = None
+    num_visual_tokens_pruned: Optional[int] = None
+    num_visual_tokens_dropped: Optional[int] = None
+    num_visual_tokens_original_total: Optional[int] = None
+    num_visual_tokens_original_per_encoder: Optional[Dict[str, int]] = None
+    num_visual_tokens_kept_total: Optional[int] = None
+    selected_token_count: Optional[int] = None
+    dropped_token_count: Optional[int] = None
+    selected_token_ratio: Optional[float] = None
+    dropped_token_ratio: Optional[float] = None
+    retention_ratio: Optional[float] = None
+    keep_ratio: Optional[float] = None
+    requested_keep_ratio: Optional[float] = None
+    keep_ratio_source: Optional[str] = None
+    effective_keep_count: Optional[int] = None
+    original_token_count: Optional[int] = None
+    effective_retention: Optional[float] = None
+    projector_retention: Optional[float] = None
+    internal_retention: Optional[float] = None
+    effective_visual_tokens_for_llm: Optional[int] = None
+    original_visual_tokens: Optional[int] = None
+    kept_visual_tokens: Optional[int] = None
+    pruned_visual_tokens: Optional[int] = None
+    llm_input_seq_len_before_prune: Optional[int] = None
+    llm_input_seq_len_after_prune: Optional[int] = None
+    llm_input_seq_len_pruned: Optional[int] = None
+    valid_token_ratio: Optional[float] = None
+    keep_indices_sorted: Optional[bool] = None
+    duplicate_indices_count: Optional[int] = None
+    fallback_used: bool = False
+    fallback_reason: Optional[str] = None
+    pruning_strategy: str = "none"
+    pruning_method: str = "none"
+    pruning_result: Optional[Dict[str, Any]] = None
+    K_total: Optional[int] = None
+    K_edge_target: Optional[int] = None
+    K_geo_target: Optional[int] = None
+    K_diverse_target: Optional[int] = None
+    K_edge_actual: Optional[int] = None
+    K_geo_actual: Optional[int] = None
+    K_diverse_actual: Optional[int] = None
+    selected_by_edge_count: Optional[int] = None
+    selected_by_geo_count: Optional[int] = None
+    selected_by_diverse_count: Optional[int] = None
+    # P7: robot geo count alias (maps from hybrid_budget_v2 metadata)
+    selected_by_robot_geo_count: Optional[int] = None
+    edge_score_mean: Optional[float] = None
+    edge_score_topk_mean: Optional[float] = None
+    near_contact_score_mean: Optional[float] = None
+    near_contact_score_topk_mean: Optional[float] = None
+    corridor_contact_score_mean: Optional[float] = None
+    corridor_contact_score_topk_mean: Optional[float] = None
+    geo_contact_score_mean: Optional[float] = None
+    geo_contact_score_topk_mean: Optional[float] = None
+    overlap_edge_geo_before_dedup: Optional[int] = None
+    is_warmup_step: Optional[bool] = None
+
+    # Existing eval aliases.
+    protected_token_ratio: Optional[float] = None
+    pruned_token_ratio: Optional[float] = None
+    hook_total_time_ms: Optional[float] = None
+    token_mapping_time_ms: Optional[float] = None
+    geometry_score_time_ms: Optional[float] = None
+    geometry_total_time_ms: Optional[float] = None
+    geometry_score_mean: Optional[float] = None
+    geometry_score_max: Optional[float] = None
+    geometry_score_std: Optional[float] = None
+    distance_score_mean: Optional[float] = None
+    direction_score_mean: Optional[float] = None
+    depth_edge_score_mean: Optional[float] = None
+    motion_cone_score_mean: Optional[float] = None
+    motion_cone_score_max: Optional[float] = None
+    workspace_score_mean: Optional[float] = None
+    workspace_score_max: Optional[float] = None
+    contact_risk_score_mean: Optional[float] = None
+    contact_risk_score_max: Optional[float] = None
+    geometry_available: Optional[bool] = None
+    robot_state_available: Optional[bool] = None
+    camera_available: Optional[bool] = None
+    d_min: Optional[float] = None
+    d_mean_topk: Optional[float] = None
+    mean_near_score: Optional[float] = None
+    max_near_score: Optional[float] = None
+    motion_norm: Optional[float] = None
+    corridor_strength_mean: Optional[float] = None
+    corridor_strength_topk_mean: Optional[float] = None
+    corridor_active: Optional[bool] = None
+    d_corridor_min: Optional[float] = None
+    d_corridor_mean_topk: Optional[float] = None
+    dynamic_enabled: Optional[bool] = None
+    dynamic_phase: Optional[str] = None
+    dynamic_keep_ratio: Optional[float] = None
+    geo_risk_level: Optional[str] = None
+    geo_risk_score: Optional[float] = None
+    dynamic_keep_reason: Optional[str] = None
+    num_high_contact_tokens: Optional[int] = None
+    num_valid_3d_tokens: Optional[int] = None
+    dynamic_keep_k: Optional[int] = None
+    d_topk_mean: Optional[float] = None
+    corridor_strength: Optional[float] = None
+    edge_concentration: Optional[float] = None
+    valid_depth_ratio: Optional[float] = None
+    phase_far_count: Optional[int] = None
+    phase_mid_count: Optional[int] = None
+    phase_near_count: Optional[int] = None
+    phase_fallback_safe_count: Optional[int] = None
+    interaction_lock: Optional[bool] = None
+    interaction_lock_reason: Optional[str] = None
+    contact_risk_lock_ratio: Optional[float] = None
+    gripper_proximity_lock_ratio: Optional[float] = None
+    region_stability_lock_ratio: Optional[float] = None
+    temporal_stability: Optional[float] = None
+    history_length: Optional[int] = None
+    score_ema_enabled: Optional[bool] = None
+    score_ema_available: Optional[bool] = None
+    lock_condition_failed_reason: Optional[str] = None
+    topk_contact_lock: Optional[bool] = None
+    elevated_current_lock: Optional[bool] = None
+    gripper_lock: Optional[bool] = None
+    region_lock: Optional[bool] = None
+    timing: HookTiming = field(default_factory=HookTiming)
+
+    # New diagnostic fields
+    depth_min: Optional[float] = None
+    depth_max: Optional[float] = None
+    depth_mean: Optional[float] = None
+    depth_valid_ratio: Optional[float] = None
+    # P0: Depth conversion metadata (populated by geometry pipeline)
+    depth_source_key: Optional[str] = None
+    depth_conversion: Optional[str] = None
+    depth_is_metric: Optional[bool] = None
+    depth_unit: Optional[str] = None
+    depth_sim_available: Optional[bool] = None
+    depth_raw_min: Optional[float] = None
+    depth_raw_max: Optional[float] = None
+    depth_raw_mean: Optional[float] = None
+    depth_raw_std: Optional[float] = None
+    depth_metric_min: Optional[float] = None
+    depth_metric_max: Optional[float] = None
+    depth_metric_mean: Optional[float] = None
+    depth_metric_std: Optional[float] = None
+    points_robot_min_xyz: Optional[str] = None
+    points_robot_max_xyz: Optional[str] = None
+    points_robot_mean_xyz: Optional[str] = None
+    points_robot_std_xyz: Optional[str] = None
+    points_cam_min_xyz: Optional[str] = None
+    points_cam_max_xyz: Optional[str] = None
+    points_cam_available: Optional[bool] = None
+    points_cam_unavailable_reason: Optional[str] = None
+    extrinsics_available: Optional[bool] = None
+    intrinsics_available: Optional[bool] = None
+    # Transform convention (P0-4 audit): fixed as T_robot_cam_forward
+    transform_convention: Optional[str] = None  # e.g. "T_robot_cam_forward"
+    transform_inverse_used: Optional[bool] = None  # False = forward T used
+    transform_source: Optional[str] = None  # e.g. "camera_extrinsics" (T_base_cam/w_cam)
+    transform_convention_verified: Optional[bool] = None  # True = verified by P0-3
+    transform_convention_evidence: Optional[str] = None  # Human/overlay decision reason
+    camera_frame_name: Optional[str] = None
+    geometry_frame_name: Optional[str] = None
+    ee_position: Optional[str] = None
+    robot_state_valid: Optional[bool] = None
+    motion_direction_valid: Optional[bool] = None
+    motion_direction_xyz: Optional[str] = None
+    distance_to_gripper_min: Optional[float] = None
+    distance_to_gripper_mean: Optional[float] = None
+    distance_to_gripper_max: Optional[float] = None
+    # Score component raw distribution stats (written per step)
+    depth_edge_score_mean: Optional[float] = None
+    depth_edge_score_std: Optional[float] = None
+    depth_edge_score_min: Optional[float] = None
+    depth_edge_score_p50: Optional[float] = None
+    depth_edge_score_p90: Optional[float] = None
+    depth_edge_score_max: Optional[float] = None
+    depth_edge_score_positive_ratio: Optional[float] = None
+    distance_score_mean: Optional[float] = None
+    distance_score_std: Optional[float] = None
+    distance_score_min: Optional[float] = None
+    distance_score_p50: Optional[float] = None
+    distance_score_p90: Optional[float] = None
+    distance_score_max: Optional[float] = None
+    motion_cone_score_mean: Optional[float] = None
+    motion_cone_score_std: Optional[float] = None
+    motion_cone_score_min: Optional[float] = None
+    motion_cone_score_p50: Optional[float] = None
+    motion_cone_score_p90: Optional[float] = None
+    motion_cone_score_max: Optional[float] = None
+    motion_cone_score_positive_ratio: Optional[float] = None
+    motion_cone_score_zero_ratio: Optional[float] = None
+    motion_dir_norm_mean: Optional[float] = None
+    motion_dir_norm_min: Optional[float] = None
+    motion_dir_norm_max: Optional[float] = None
+    workspace_score_mean: Optional[float] = None
+    workspace_score_std: Optional[float] = None
+    workspace_score_max: Optional[float] = None
+    # Plural variants matching _append_score_stats output key pattern: key.replace("_scores", "_score")
+    workspace_scores_mean: Optional[float] = None
+    workspace_scores_std: Optional[float] = None
+    workspace_scores_max: Optional[float] = None
+    contact_risk_score_mean: Optional[float] = None
+    contact_risk_score_std: Optional[float] = None
+    contact_risk_score_min: Optional[float] = None
+    contact_risk_score_p50: Optional[float] = None
+    contact_risk_score_p90: Optional[float] = None
+    contact_risk_score_max: Optional[float] = None
+    final_geometry_score_mean: Optional[float] = None
+    final_geometry_score_std: Optional[float] = None
+    final_geometry_score_min: Optional[float] = None
+    final_geometry_score_p50: Optional[float] = None
+    final_geometry_score_p90: Optional[float] = None
+    final_geometry_score_max: Optional[float] = None
+    # Selected token score distributions
+    selected_depth_edge_score_mean: Optional[float] = None
+    selected_distance_score_mean: Optional[float] = None
+    selected_motion_cone_score_mean: Optional[float] = None
+    selected_workspace_score_mean: Optional[float] = None
+    selected_contact_risk_score_mean: Optional[float] = None
+    selected_final_score_mean: Optional[float] = None
+    # Hybrid quota union stats
+    selected_by_depth_edge_count: Optional[int] = None
+    selected_by_robot_geo_count: Optional[int] = None
+    selected_by_uniform_count: Optional[int] = None
+    selected_by_fill_count: Optional[int] = None
+    depth_edge_quota_count: Optional[int] = None
+    robot_geo_quota_count: Optional[int] = None
+    uniform_quota_count: Optional[int] = None
+    fill_count: Optional[int] = None
+    overlap_depth_robot_geo: Optional[int] = None
+    # Temporal v1: adaptive threshold
+    adaptive_threshold_mean: Optional[float] = None
+    adaptive_threshold_max: Optional[float] = None
+    ema_used_for_selection: Optional[bool] = None
+    # Hybrid v1: weighted score stats
+    w_edge: Optional[float] = None
+    w_near: Optional[float] = None
+    w_contact: Optional[float] = None
+    w_corr: Optional[float] = None
+    w_diverse: Optional[float] = None
+    edge_score_mean: Optional[float] = None
+    edge_score_max: Optional[float] = None
+    edge_score_std: Optional[float] = None
+    near_score_mean: Optional[float] = None
+    near_score_max: Optional[float] = None
+    near_score_std: Optional[float] = None
+    contact_score_mean: Optional[float] = None
+    contact_score_max: Optional[float] = None
+    contact_score_std: Optional[float] = None
+    corridor_score_mean: Optional[float] = None
+    corridor_score_max: Optional[float] = None
+    corridor_score_std: Optional[float] = None
+    diversity_score_mean: Optional[float] = None
+    diversity_score_max: Optional[float] = None
+    diversity_score_std: Optional[float] = None
+    final_hybrid_score_mean: Optional[float] = None
+    final_hybrid_score_max: Optional[float] = None
+    final_hybrid_score_std: Optional[float] = None
+    selected_grid_coverage_ratio: Optional[float] = None
+    grid_coverage_ratio: Optional[float] = None
+    # Hybrid/score component aliases for StepMetrics parity
+    hybrid_score_mean: Optional[float] = None
+    hybrid_score_max: Optional[float] = None
+    hybrid_score_std: Optional[float] = None
+    selected_token_grid_entropy: Optional[float] = None
+    actual_keep_ratio: Optional[float] = None
+    hook_overhead_ms: Optional[float] = None
+    # P1-1: Score component is_none flags (populated by hybrid_v1 branch)
+    contact_risk_scores_is_none: Optional[bool] = None
+    motion_cone_scores_is_none: Optional[bool] = None
+    workspace_scores_is_none: Optional[bool] = None
+    contact_nonzero_ratio: Optional[float] = None
+    motion_cone_nonzero_ratio: Optional[float] = None
+    workspace_nonzero_ratio: Optional[float] = None
+    # P1-1: temporal_v1 semantics fix
+    temporal_enabled: Optional[bool] = None
+    interaction_lock_triggered: Optional[bool] = None
+    interaction_lock_reason: Optional[str] = None
+    # P1-1: Attribution missing reason (logged when aux_metrics lacks required fields)
+    attribution_missing_reason: Optional[str] = None
+
+    # ---- P1-1: Token selection attribution / top-k competition diagnostics ----
+    # Workspace score diagnostics
+    workspace_score_min: Optional[float] = None
+    workspace_score_std: Optional[float] = None
+    workspace_score_p50: Optional[float] = None
+    workspace_score_p90: Optional[float] = None
+    workspace_score_unique_count: Optional[int] = None
+    workspace_all_one: Optional[bool] = None
+    workspace_all_one_reason: Optional[str] = None
+    workspace_fallback_used: Optional[bool] = None
+    workspace_bounds: Optional[str] = None
+    workspace_valid_token_ratio: Optional[float] = None
+
+    # Score component unique counts (diagnostic for degeneracy)
+    near_score_unique_count: Optional[int] = None
+    depth_edge_score_unique_count: Optional[int] = None
+    motion_cone_score_unique_count: Optional[int] = None
+    final_score_unique_count: Optional[int] = None
+
+    # Top-k overlap competition (robot_geo vs depth_edge vs final)
+    depth_edge_topk_count: Optional[int] = None
+    robot_geo_topk_count: Optional[int] = None  # legacy: hybrid/final-score top-k
+    hybrid_final_score_topk_count: Optional[int] = None
+    final_selected_count: Optional[int] = None
+    depth_edge_topk_kept_in_final_count: Optional[int] = None
+    robot_geo_topk_kept_in_final_count: Optional[int] = None  # legacy
+    hybrid_final_score_topk_kept_count: Optional[int] = None
+    depth_edge_topk_dropped_count: Optional[int] = None
+    robot_geo_topk_dropped_count: Optional[int] = None  # legacy
+    hybrid_final_score_topk_dropped_count: Optional[int] = None
+    depth_edge_topk_dropped_ratio: Optional[float] = None
+    robot_geo_topk_dropped_ratio: Optional[float] = None  # legacy
+    hybrid_final_score_topk_dropped_ratio: Optional[float] = None
+    overlap_depth_edge_robot_geo_count: Optional[int] = None
+    overlap_depth_edge_robot_geo_ratio: Optional[float] = None
+
+    # Selected token spatial distribution (UV grid coordinates)
+    selected_token_u_mean: Optional[float] = None
+    selected_token_u_std: Optional[float] = None
+    selected_token_v_mean: Optional[float] = None
+    selected_token_v_std: Optional[float] = None
+    selected_token_bbox_u_min: Optional[int] = None
+    selected_token_bbox_u_max: Optional[int] = None
+    selected_token_bbox_v_min: Optional[int] = None
+    selected_token_bbox_v_max: Optional[int] = None
+    selected_token_grid_quadrant_histogram: Optional[str] = None
+    selected_token_near_gripper_pixel_dist_mean: Optional[float] = None
+    selected_token_near_gripper_pixel_dist_median: Optional[float] = None
+
+    # Selected token attribution ratios
+    selected_near_token_ratio: Optional[float] = None
+    selected_motion_token_ratio: Optional[float] = None
+    selected_workspace_token_ratio: Optional[float] = None
+    selected_robot_token_ratio: Optional[float] = None
+    selected_scene_token_ratio: Optional[float] = None
+    selected_background_token_ratio: Optional[float] = None
+    selected_high_depth_edge_but_low_robot_geo_count: Optional[int] = None
+    dropped_high_depth_edge_tokens_count: Optional[int] = None
+    dropped_high_robot_geo_tokens_count: Optional[int] = None
+
+    # Hybrid v1 specific: depth_edge and robot_geo top-k separate selection
+    depth_edge_quota_count: Optional[int] = None
+    robot_geo_quota_count: Optional[int] = None
+    selected_overlap_robot_geo_depth_edge_ratio: Optional[float] = None
+    selected_overlap_robot_geo_motion_ratio: Optional[float] = None
+    selected_overlap_robot_geo_near_ratio: Optional[float] = None
+    depth_edge_topk_overlap_with_robot_geo_topk: Optional[float] = None
+    robot_geo_topk_overlap_with_depth_edge_topk: Optional[float] = None
+
+    # P5: Edge reserve ablation diagnostics (robot_geo_hybrid_temporal_edge_reserve_v1)
+    edge_reserve_enabled: Optional[bool] = None
+    edge_reserve_ratio: Optional[float] = None
+    edge_reserved_target_count: Optional[int] = None
+    edge_reserved_actual_count: Optional[int] = None
+    edge_reserved_survival_ratio: Optional[float] = None
+    final_selected_count: Optional[int] = None
+    selected_by_edge_reserved_count: Optional[int] = None
+    selected_by_original_hybrid_count: Optional[int] = None
+    selected_by_fill_count: Optional[int] = None
+    duplicate_edge_hybrid_count: Optional[int] = None
+
+    # P5-fix: renamed duplicate metrics (added duplicates_with_original_hybrid_count)
+    duplicate_after_exclusion_count: Optional[int] = None
+    duplicate_with_original_hybrid_count: Optional[int] = None
+
+    # P5-fix: reserved / non-reserved split diagnostics
+    reserved_edge_topk_count: Optional[int] = None
+    reserved_edge_kept_count: Optional[int] = None
+    reserved_edge_dropped_count: Optional[int] = None
+    reserved_edge_topk_dropped_ratio: Optional[float] = None
+    non_reserved_edge_topk_count: Optional[int] = None
+    non_reserved_edge_kept_count: Optional[int] = None
+    non_reserved_edge_dropped_count: Optional[int] = None
+    non_reserved_edge_topk_dropped_ratio: Optional[float] = None
+    overall_depth_edge_topk_count: Optional[int] = None
+    overall_depth_edge_topk_kept_count: Optional[int] = None
+    overall_depth_edge_topk_dropped_count: Optional[int] = None
+    overall_depth_edge_topk_dropped_ratio: Optional[float] = None
+
+    # P5-fix: edge_reserve invalid flag (written when edge_reserve_enabled=True but mechanism failed)
+    edge_reserve_invalid: Optional[bool] = None
+    edge_reserve_invalid_reason: Optional[str] = None
+
+    # P5-fix: edge_scores diagnostic
+    edge_scores_available: Optional[bool] = None
+    edge_scores_shape: Optional[int] = None
+    edge_scores_finite_ratio: Optional[float] = None
+
+    # P5-fix: accounting and invariant checks
+    edge_reserve_accounting_valid: Optional[bool] = None
+    edge_reserve_accounting_error: Optional[str] = None
+    edge_reserve_split_metrics_valid: Optional[bool] = None
+    diagnostic_k_small: Optional[int] = None
+    diagnostic_k_large: Optional[int] = None
+    no_duplicate_final_indices: Optional[bool] = None
+    final_indices_sorted: Optional[bool] = None
+    selected_token_count_equals_kept: Optional[bool] = None
+    retention_ratio_valid: Optional[bool] = None
+    # P5-fix: new phase-level attribution counts
+    selected_by_phase1_hybrid_count: Optional[int] = None
+    selected_by_phase2_diversity_count: Optional[int] = None
+    selected_by_phase3_fallback_count: Optional[int] = None
+    selected_by_unattributed_count: Optional[int] = None
+
+    # Stage X: Selection Path Integrity Audit diagnostics
+    # Recorded at every pruning step to trace the actual selector used
+    requested_pruning_strategy: Optional[str] = None   # CLI/config requested strategy
+    effective_pruning_strategy: Optional[str] = None   # actual strategy after fallback
+    selector_name: Optional[str] = None                # selector identity, usually strategy-level
+    selector_function_name: Optional[str] = None       # which selector function was called
+    selection_strategy_name: Optional[str] = None      # strategy reported by selector metadata
+    selection_stage_name: Optional[str] = None         # stage/path within selector
+    selector_success: Optional[bool] = None           # True=returned normally, False=exception
+    selector_exception_type: Optional[str] = None      # e.g. "NameError", "ValueError"
+    selector_exception_msg: Optional[str] = None        # first 200 chars of exception
+    fallback_selector_name: Optional[str] = None       # e.g. "depth_edge_fast_diverse"
+    keep_indices_source: Optional[str] = None           # e.g. "select_hybrid_v1", "fallback_depth_edge_diverse"
+    keep_indices_count: Optional[int] = None           # len(keep_indices)
+    keep_indices_sorted: Optional[bool] = None
+    keep_indices_unique: Optional[bool] = None
+    keep_indices_out_of_bounds: Optional[bool] = None
+    actual_retention_ratio: Optional[float] = None      # len(keep_indices) / num_tokens
+    keep_ratio_requested: Optional[float] = None
+    keep_ratio_actual: Optional[float] = None
+    retention_actual: Optional[float] = None
+    selection_error: Optional[str] = None
+    selection_warning: Optional[str] = None
+    selected_by_phase1: Optional[int] = None
+    selected_by_phase2: Optional[int] = None
+    selected_by_phase3: Optional[int] = None
+    selected_by_fill: Optional[int] = None
+    selected_by_fallback: Optional[int] = None
+    selected_unattributed: Optional[int] = None
+    phase_accounting_sum: Optional[int] = None
+    phase_accounting_valid: Optional[bool] = None
+    phase_accounting_error: Optional[str] = None
+    reserved_edge_dropped_ratio: Optional[float] = None
+    non_reserved_topk_count: Optional[int] = None
+    non_reserved_kept_count: Optional[int] = None
+    non_reserved_dropped_count: Optional[int] = None
+    non_reserved_dropped_ratio: Optional[float] = None
+    total_keep_budget: Optional[int] = None
+    depth_edge_budget: Optional[int] = None
+    robot_geo_budget: Optional[int] = None
+    robot_contact_budget: Optional[int] = None
+    fill_budget: Optional[int] = None
+    safety_budget: Optional[int] = None
+    score_min: Optional[float] = None
+    score_max: Optional[float] = None
+    score_mean: Optional[float] = None
+    score_std: Optional[float] = None
+    # P7: hybrid_budget_v2 fields
+    hybrid_budget_v2: Optional[bool] = None
+    depth_edge_budget_ratio: Optional[float] = None
+    robot_contact_budget_ratio: Optional[float] = None
+    safety_budget_ratio: Optional[float] = None
+    K_depth_actual: Optional[int] = None
+    K_robot_actual: Optional[int] = None
+    K_fill_actual: Optional[int] = None
+    overlap_depth_robot_count: Optional[int] = None
+    overlap_depth_robot_diagnostic: Optional[int] = None
+    depth_edge_candidates_count: Optional[int] = None
+    robot_geo_candidates_count: Optional[int] = None
+    depth_edge_reserved_kept_count: Optional[int] = None
+    robot_geo_reserved_kept_count: Optional[int] = None
+    fill_from_depth_count: Optional[int] = None
+    fill_from_robot_count: Optional[int] = None
+    fill_from_other_count: Optional[int] = None
+
+    # P11: branch_budget_v0 fields
+    branch_budget_v0: Optional[bool] = None
+    hybrid_action_budget: Optional[int] = None
+    diversity_fill_budget: Optional[int] = None
+    temporal_budget: Optional[int] = None  # always null for v0
+    branch_accounting_valid: Optional[bool] = None
+    branch_sum_equals_kept: Optional[bool] = None
+    selected_by_depth_branch_count: Optional[int] = None
+    selected_by_hybrid_branch_count: Optional[int] = None
+    selected_by_fill_branch_count: Optional[int] = None
+    overlap_depth_edge_hybrid_count: Optional[int] = None
+    overlap_depth_edge_hybrid_ratio: Optional[float] = None
+    non_reserved_depth_edge_dropped_ratio: Optional[float] = None
+    non_reserved_depth_edge_count: Optional[int] = None
+    non_reserved_depth_edge_kept: Optional[int] = None
+    non_reserved_depth_edge_dropped: Optional[int] = None
+    branch_budget_depth_ratio_override: Optional[float] = None
+    branch_budget_hybrid_ratio_override: Optional[float] = None
+    # P11.3: DE top-k attribution by branch
+    depth_edge_topk_kept_by_depth_branch_count: Optional[int] = None
+    depth_edge_topk_kept_by_hybrid_branch_count: Optional[int] = None
+    depth_edge_topk_kept_by_fill_branch_count: Optional[int] = None
+    depth_edge_topk_kept_by_fallback_count: Optional[int] = None
+    depth_edge_topk_survival_ratio: Optional[float] = None
+    # P11.3: Hybrid/final-score top-k attribution by branch
+    hybrid_final_score_topk_kept_by_depth_branch_count: Optional[int] = None
+    hybrid_final_score_topk_kept_by_hybrid_branch_count: Optional[int] = None
+    hybrid_final_score_topk_kept_by_fill_branch_count: Optional[int] = None
+    hybrid_final_score_topk_kept_by_fallback_count: Optional[int] = None
+    hybrid_final_score_topk_survival_ratio: Optional[float] = None
+    # P11.3: Legacy aliases for hybrid top-k (P8 compat)
+    hybrid_topk_kept_by_depth_branch_count: Optional[int] = None
+    hybrid_topk_kept_by_hybrid_branch_count: Optional[int] = None
+    hybrid_topk_kept_by_fill_branch_count: Optional[int] = None
+    hybrid_topk_kept_by_fallback_count: Optional[int] = None
+    hybrid_topk_survival_ratio: Optional[float] = None
+
+    # P14-B: Robot-self mask diagnostics
+    robot_self_mask_enabled: Optional[bool] = None
+    self_mask_available: Optional[bool] = None
+    self_mask_core_radius_px: Optional[float] = None
+    self_mask_token_count: Optional[int] = None
+    self_mask_token_ratio: Optional[float] = None
+    selected_self_mask_token_count: Optional[int] = None
+    selected_self_mask_token_ratio: Optional[float] = None
+    near_score_mean_before_self_mask: Optional[float] = None
+    near_score_mean_after_self_mask: Optional[float] = None
+    near_score_self_region_mean: Optional[float] = None
+    near_score_nonself_region_mean: Optional[float] = None
+    hybrid_score_mean_before_self_mask: Optional[float] = None
+    hybrid_score_mean_after_self_mask: Optional[float] = None
+    gripper_pixel_u: Optional[float] = None
+    gripper_pixel_v: Optional[float] = None
+    gripper_in_bounds: Optional[bool] = None
+    gripper_pixel_in_bounds: Optional[bool] = None
+    gripper_projection_valid: Optional[bool] = None
+
+    # P15: ACGTP-v1 metric fields
+    # ACGTP-v1 strategy flag
+    acgtp_v1: Optional[bool] = None
+    # Branch weight configuration
+    acgtp_w_scene_layout: Optional[float] = None
+    acgtp_w_depth_structure: Optional[float] = None
+    acgtp_w_contact_ring: Optional[float] = None
+    acgtp_w_motion_corridor: Optional[float] = None
+    # Self-filtered contact ring
+    acgtp_self_core_radius_px: Optional[float] = None
+    acgtp_contact_ring_inner_px: Optional[float] = None
+    acgtp_contact_ring_outer_px: Optional[float] = None
+    acgtp_self_core_token_count: Optional[int] = None
+    acgtp_self_core_token_ratio: Optional[float] = None
+    acgtp_contact_ring_token_count: Optional[int] = None
+    acgtp_contact_ring_token_ratio: Optional[float] = None
+    acgtp_contact_ring_gated_token_count: Optional[int] = None
+    acgtp_contact_ring_valid: Optional[bool] = None
+    # Scene layout branch
+    acgtp_scene_layout_score_mean: Optional[float] = None
+    acgtp_scene_layout_score_max: Optional[float] = None
+    acgtp_support_plane_token_count: Optional[int] = None
+    acgtp_object_component_token_count: Optional[int] = None
+    acgtp_boundary_token_count: Optional[int] = None
+    acgtp_scene_fill_candidate_count: Optional[int] = None
+    acgtp_scene_fill_candidate_ratio: Optional[float] = None
+    # P6: support_plane cap diagnostics
+    acgtp_support_plane_candidate_count: Optional[int] = None
+    acgtp_scene_support_plane_cap_ratio: Optional[float] = None
+    acgtp_scene_support_plane_cap_used: Optional[bool] = None
+    acgtp_scene_support_plane_fallback_used: Optional[bool] = None
+    acgtp_scene_support_plane_fallback_reason: Optional[str] = None
+    # P6: object_component fallback
+    acgtp_scene_object_component_fallback_used: Optional[bool] = None
+    acgtp_scene_object_component_fallback_reason: Optional[str] = None
+    acgtp_scene_object_component_num_components: Optional[int] = None
+    # P6: boundary fallback + source attribution
+    acgtp_scene_boundary_fallback_used: Optional[bool] = None
+    acgtp_scene_boundary_fallback_reason: Optional[str] = None
+    acgtp_scene_boundary_from_object_count: Optional[int] = None
+    acgtp_scene_boundary_from_depth_count: Optional[int] = None
+    # P6: per-branch timing (ms)
+    acgtp_scene_layout_ms: Optional[float] = None
+    acgtp_contact_ring_ms: Optional[float] = None
+    acgtp_motion_corridor_ms: Optional[float] = None
+    acgtp_static_scene_cache_enabled: Optional[bool] = None
+    acgtp_static_scene_cache_hit: Optional[bool] = None
+    acgtp_static_scene_cache_reason: Optional[str] = None
+    acgtp_static_scene_cache_depth_delta: Optional[float] = None
+    acgtp_static_scene_cache_valid_iou: Optional[float] = None
+    acgtp_static_scene_cache_age: Optional[int] = None
+    acgtp_latency_plan_cache_enabled: Optional[bool] = None
+    acgtp_latency_plan_cache_hit: Optional[bool] = None
+    acgtp_latency_plan_cache_reason: Optional[str] = None
+    acgtp_latency_plan_cache_age: Optional[int] = None
+    acgtp_latency_plan_cache_depth_delta: Optional[float] = None
+    acgtp_latency_plan_cache_gripper_delta: Optional[float] = None
+    acgtp_latency_plan_cache_lookup_ms: Optional[float] = None
+    acgtp_latency_plan_cache_keep_count: Optional[int] = None
+    # Scene layout per-component selected attribution (post-selection)
+    acgtp_scene_selected_support_plane_count: Optional[int] = None
+    acgtp_scene_selected_object_component_count: Optional[int] = None
+    acgtp_scene_selected_boundary_count: Optional[int] = None
+    acgtp_scene_selected_relation_count: Optional[int] = None
+    acgtp_scene_support_plane_selected_ratio: Optional[float] = None
+    # Motion corridor
+    acgtp_motion_corridor_valid: Optional[bool] = None
+    acgtp_motion_corridor_score_mean: Optional[float] = None
+    acgtp_motion_corridor_score_max: Optional[float] = None
+    acgtp_motion_corridor_length_m: Optional[float] = None
+    acgtp_motion_norm_m: Optional[float] = None
+    acgtp_motion_ema_alpha: Optional[float] = None
+    # Depth structure (edge) branch
+    acgtp_depth_structure_score_mean: Optional[float] = None
+    acgtp_depth_structure_score_max: Optional[float] = None
+    # ACGTP-v1 mixture action-constraint score
+    acgtp_action_constraint_score_mean: Optional[float] = None
+    acgtp_action_constraint_score_max: Optional[float] = None
+    acgtp_action_constraint_source: Optional[str] = None
+    acgtp_future_action_constraint_enabled: Optional[bool] = None
+    acgtp_future_action_constraint_valid: Optional[bool] = None
+    acgtp_future_action_constraint_disabled_reason: Optional[str] = None
+    acgtp_future_action_constraint_score_mean: Optional[float] = None
+    acgtp_future_action_constraint_score_max: Optional[float] = None
+    acgtp_object_side_contact_score_mean: Optional[float] = None
+    acgtp_object_side_contact_score_max: Optional[float] = None
+    acgtp_swept_motion_risk_score_mean: Optional[float] = None
+    acgtp_swept_motion_risk_score_max: Optional[float] = None
+    acgtp_collision_contact_risk_score_mean: Optional[float] = None
+    acgtp_collision_contact_risk_score_max: Optional[float] = None
+    acgtp_contact_object_overlap_count: Optional[int] = None
+    acgtp_robot_self_penalty_count: Optional[int] = None
+    acgtp_action_constraint_ms: Optional[float] = None
+    # Step 7: explicit branch-ablation probe.
+    acgtp_ablate_enabled: Optional[bool] = None
+    acgtp_ablate_branches: Optional[str] = None
+    acgtp_ablate_scene: Optional[bool] = None
+    acgtp_ablate_depth: Optional[bool] = None
+    acgtp_ablate_contact: Optional[bool] = None
+    acgtp_ablate_motion: Optional[bool] = None
+    acgtp_ablate_fill: Optional[bool] = None
+    # Step 6: ACGTP history stabilizer
+    acgtp_history_enabled: Optional[bool] = None
+    acgtp_history_length: Optional[int] = None
+    acgtp_history_capacity: Optional[int] = None
+    acgtp_history_length_after_update: Optional[int] = None
+    acgtp_history_warmup: Optional[bool] = None
+    acgtp_history_ema_available: Optional[bool] = None
+    acgtp_history_smoothing_applied: Optional[bool] = None
+    acgtp_history_conservative_mode: Optional[bool] = None
+    acgtp_history_conservative_reason: Optional[str] = None
+    acgtp_history_disabled_reason: Optional[str] = None
+    acgtp_history_depth_change: Optional[float] = None
+    acgtp_history_keep_mask_iou: Optional[float] = None
+    acgtp_history_motion_stability: Optional[float] = None
+    acgtp_history_depth_valid_ratio: Optional[float] = None
+    acgtp_history_scene_ema_alpha: Optional[float] = None
+    acgtp_history_depth_ema_alpha: Optional[float] = None
+    acgtp_history_contact_ema_alpha: Optional[float] = None
+    acgtp_history_motion_ema_alpha: Optional[float] = None
+    acgtp_history_action_ema_alpha: Optional[float] = None
+    acgtp_history_phase_switch: Optional[bool] = None
+    acgtp_history_force_conservative_next: Optional[bool] = None
+    acgtp_history_force_conservative_reason: Optional[str] = None
+    acgtp_history_keep_boost_applied: Optional[bool] = None
+    # Step 5: ACGTP dynamic phase/risk controller
+    acgtp_dynamic_enabled: Optional[bool] = None
+    acgtp_dynamic_phase: Optional[str] = None
+    acgtp_dynamic_candidate_phase: Optional[str] = None
+    acgtp_dynamic_previous_phase: Optional[str] = None
+    acgtp_dynamic_hysteresis_state: Optional[str] = None
+    acgtp_dynamic_risk: Optional[float] = None
+    acgtp_dynamic_confidence: Optional[float] = None
+    acgtp_dynamic_keep_ratio: Optional[float] = None
+    acgtp_dynamic_keep_k: Optional[int] = None
+    acgtp_dynamic_base_keep_ratio: Optional[float] = None
+    acgtp_dynamic_raw_keep_ratio: Optional[float] = None
+    acgtp_dynamic_phase_min_keep_ratio: Optional[float] = None
+    acgtp_dynamic_phase_max_keep_ratio: Optional[float] = None
+    acgtp_dynamic_lock_strength: Optional[float] = None
+    acgtp_dynamic_uncertainty_boost: Optional[float] = None
+    acgtp_dynamic_risk_boost: Optional[float] = None
+    acgtp_dynamic_prune_gain: Optional[float] = None
+    acgtp_dynamic_keep_reason: Optional[str] = None
+    acgtp_dynamic_phase_schedule: Optional[str] = None
+    acgtp_dynamic_branch_floor_enabled: Optional[bool] = None
+    acgtp_dynamic_min_scene_tokens: Optional[int] = None
+    acgtp_dynamic_min_depth_tokens: Optional[int] = None
+    acgtp_dynamic_min_contact_tokens: Optional[int] = None
+    acgtp_dynamic_min_motion_tokens: Optional[int] = None
+    acgtp_dynamic_fill_cap_ratio: Optional[float] = None
+    acgtp_dynamic_fill_cap_tokens: Optional[int] = None
+    acgtp_dynamic_layout_motion_alignment: Optional[float] = None
+    acgtp_dynamic_binary_alignment: Optional[float] = None
+    acgtp_dynamic_contact_phase_gate: Optional[str] = None
+    acgtp_dynamic_contact_peak: Optional[float] = None
+    acgtp_dynamic_contact_mean: Optional[float] = None
+    acgtp_dynamic_contact_ratio: Optional[float] = None
+    acgtp_dynamic_motion_peak: Optional[float] = None
+    acgtp_dynamic_motion_mean: Optional[float] = None
+    acgtp_dynamic_motion_ratio: Optional[float] = None
+    acgtp_dynamic_physical_ratio: Optional[float] = None
+    acgtp_dynamic_high_contact: Optional[bool] = None
+    acgtp_dynamic_high_contact_coverage: Optional[bool] = None
+    acgtp_dynamic_high_contact_legacy: Optional[bool] = None
+    acgtp_dynamic_shadow_contact_guard: Optional[bool] = None
+    acgtp_dynamic_high_motion: Optional[bool] = None
+    acgtp_dynamic_strong_layout: Optional[bool] = None
+    acgtp_dynamic_action_peak: Optional[float] = None
+    acgtp_dynamic_action_mean: Optional[float] = None
+    acgtp_dynamic_depth_valid_ratio: Optional[float] = None
+    acgtp_dynamic_fill_candidate_count: Optional[int] = None
+    acgtp_dynamic_fill_candidate_ratio: Optional[float] = None
+    acgtp_dynamic_candidate_gap_count: Optional[int] = None
+    acgtp_dynamic_candidate_gap_ratio: Optional[float] = None
+    acgtp_dynamic_candidate_clamped: Optional[bool] = None
+    acgtp_dynamic_scene_weight: Optional[float] = None
+    acgtp_dynamic_depth_weight: Optional[float] = None
+    acgtp_dynamic_contact_weight: Optional[float] = None
+    acgtp_dynamic_motion_weight: Optional[float] = None
+    acgtp_dynamic_hard_protect_ratio: Optional[float] = None
+    acgtp_dynamic_budget_vector: Optional[str] = None
+    acgtp_dynamic_disabled_reason: Optional[str] = None
+    # ACGTP-v2.1 selector policy diagnostics
+    acgtp_selector_version: Optional[str] = None
+    acgtp_quota_policy: Optional[str] = None
+    acgtp_fill_policy: Optional[str] = None
+    # Hard protect selection
+    acgtp_hard_protect_count: Optional[int] = None
+    acgtp_hard_protect_ratio: Optional[float] = None
+    acgtp_hard_protect_valid: Optional[bool] = None
+    acgtp_scene_quota: Optional[int] = None
+    acgtp_depth_quota: Optional[int] = None
+    acgtp_contact_quota: Optional[int] = None
+    acgtp_motion_quota: Optional[int] = None
+    acgtp_scene_quota_weight: Optional[float] = None
+    acgtp_depth_quota_weight: Optional[float] = None
+    acgtp_contact_quota_weight: Optional[float] = None
+    acgtp_motion_quota_weight: Optional[float] = None
+    acgtp_min_scene_tokens: Optional[int] = None
+    acgtp_min_depth_tokens: Optional[int] = None
+    acgtp_min_contact_tokens: Optional[int] = None
+    acgtp_min_motion_tokens: Optional[int] = None
+    acgtp_scene_allocated: Optional[int] = None
+    acgtp_depth_allocated: Optional[int] = None
+    acgtp_contact_allocated: Optional[int] = None
+    acgtp_motion_allocated: Optional[int] = None
+    acgtp_coverage_fill_candidate_count: Optional[int] = None
+    acgtp_coverage_fill_candidate_ratio: Optional[float] = None
+    acgtp_constrained_fill_cap_tokens: Optional[int] = None
+    acgtp_constrained_fill_cap_applied: Optional[bool] = None
+    # Selection attribution counts (non-overlapping, priority: scene > depth > contact > motion > fill > fallback)
+    selected_by_scene_layout_count: Optional[int] = None
+    selected_by_depth_structure_count: Optional[int] = None
+    selected_by_contact_ring_count: Optional[int] = None
+    selected_by_motion_corridor_count: Optional[int] = None
+    selected_by_constrained_fill_count: Optional[int] = None
+    selected_by_acgtp_fallback_count: Optional[int] = None
+    # Overlap counts (for diagnostics)
+    overlap_scene_depth_count: Optional[int] = None
+    overlap_scene_contact_count: Optional[int] = None
+    overlap_contact_motion_count: Optional[int] = None
+    overlap_scene_motion_count: Optional[int] = None
+    overlap_depth_contact_count: Optional[int] = None
+    overlap_depth_motion_count: Optional[int] = None
+    # Accounting validation
+    acgtp_branch_accounting_valid: Optional[bool] = None
+    acgtp_branch_sum: Optional[int] = None
+    acgtp_branch_sum_error: Optional[int] = None
+    # Branch accounting valid (alias for compat)
+    branch_accounting_valid: Optional[bool] = None
+    branch_sum_equals_kept: Optional[bool] = None
+    # Hard-protect ratio used
+    acgtp_hard_protect_ratio_config: Optional[float] = None
+    # Fallback info
+    acgtp_fallback_used: Optional[bool] = None
+    acgtp_fallback_reason: Optional[str] = None
+    # Motion corridor disabled reasons
+    acgtp_motion_disabled_reason: Optional[str] = None
+    # Debug maps (recorded as JSON-serializable strings / lists for step_metrics.csv)
+    acgtp_scene_layout_scores: Optional[str] = None
+    acgtp_contact_ring_scores: Optional[str] = None
+    acgtp_motion_corridor_scores: Optional[str] = None
+    acgtp_action_constraint_scores: Optional[str] = None
+    acgtp_constrained_fill_mask: Optional[str] = None
+    acgtp_robot_self_core_mask: Optional[str] = None
+    # Final selection stats
+    acgtp_final_kept: Optional[int] = None
+    acgtp_expected_kept: Optional[int] = None
+    acgtp_actual_keep_ratio: Optional[float] = None
+
+    # P16: ACGTP-v2 — Task-Semantic Anchor Branch
+    # Strategy flags
+    acgtp_v2: Optional[bool] = None
+    # Semantic configuration
+    acgtp_v2_semantic_enabled: Optional[bool] = None
+    acgtp_v2_semantic_backend: Optional[str] = None
+    acgtp_v2_semantic_confidence: Optional[float] = None
+    acgtp_v2_semantic_unavailable: Optional[bool] = None
+    acgtp_v2_semantic_fallback_reason: Optional[str] = None
+    acgtp_v2_release_quota: Optional[bool] = None
+    acgtp_v2_parsed_instruction_meaningful: Optional[bool] = None
+    acgtp_v2_parsed_target_terms: Optional[str] = None
+    acgtp_v2_parsed_reference_terms: Optional[str] = None
+    acgtp_v2_parsed_relation_terms: Optional[str] = None
+    # Semantic branch weights
+    acgtp_v2_w_semantic_target: Optional[float] = None
+    acgtp_v2_w_semantic_reference: Optional[float] = None
+    acgtp_v2_w_semantic_relation: Optional[float] = None
+    acgtp_v2_w_semantic_goal: Optional[float] = None
+    # Semantic token counts
+    acgtp_v2_semantic_target_token_count: Optional[int] = None
+    acgtp_v2_semantic_target_kept_count: Optional[int] = None
+    acgtp_v2_semantic_target_kept_ratio: Optional[float] = None
+    acgtp_v2_semantic_reference_token_count: Optional[int] = None
+    acgtp_v2_semantic_reference_kept_count: Optional[int] = None
+    acgtp_v2_semantic_reference_kept_ratio: Optional[float] = None
+    acgtp_v2_semantic_relation_token_count: Optional[int] = None
+    acgtp_v2_semantic_relation_kept_count: Optional[int] = None
+    acgtp_v2_semantic_relation_kept_ratio: Optional[float] = None
+    acgtp_v2_semantic_goal_token_count: Optional[int] = None
+    acgtp_v2_semantic_goal_kept_count: Optional[int] = None
+    acgtp_v2_semantic_goal_kept_ratio: Optional[float] = None
+    acgtp_v2_semantic_anchor_token_count: Optional[int] = None
+    # Semantic branch attribution
+    selected_by_semantic_target_count: Optional[int] = None
+    selected_by_semantic_reference_count: Optional[int] = None
+    selected_by_semantic_relation_count: Optional[int] = None
+    selected_by_semantic_goal_count: Optional[int] = None
+    selected_by_scene_residual_fill_count: Optional[int] = None
+    # Semantic overlap with other branches
+    semantic_overlap_with_scene_count: Optional[int] = None
+    semantic_overlap_with_depth_count: Optional[int] = None
+    semantic_overlap_with_contact_count: Optional[int] = None
+    semantic_overlap_with_motion_count: Optional[int] = None
+    # Semantic quota
+    acgtp_v2_hard_semantic_quota: Optional[int] = None
+    acgtp_v2_target_cap_k: Optional[int] = None
+    acgtp_v2_reference_cap_k: Optional[int] = None
+    acgtp_v2_relation_cap_k: Optional[int] = None
+    # P16 corrected naming for geometry-only leftover
+    acgtp_scene_selected_residual_fill_count: Optional[int] = None
+    acgtp_scene_residual_fill_token_count: Optional[int] = None
+    acgtp_scene_residual_fill_token_count_computed: Optional[bool] = None
+    # Per-branch accounting
+    selected_by_semantic_count: Optional[int] = None
+    # P16: ACGTP-v2 — strict fallback dispatch fields
+    strict_fallback_dispatch_used: Optional[bool] = None
+    delegated_selector_name: Optional[str] = None
+    fallback_dispatch_to_v1: Optional[bool] = None  # backward-compat alias for strict fallback
+    selector_name: Optional[str] = None  # effective selector name (e.g. "select_acgtp_v2")
+    # P16: Semantic state (aliases for acgtp_v2_* for eval metrics convenience)
+    semantic_backend: Optional[str] = None
+    semantic_unavailable: Optional[bool] = None
+    semantic_confidence: Optional[float] = None
+    semantic_available: Optional[bool] = None
+    semantic_quota_released: Optional[bool] = None
+    # P16: Attention task-relevance branch
+    attention_backend: Optional[str] = None
+    attention_source: Optional[str] = None
+    attention_available: Optional[bool] = None
+    attention_confidence: Optional[float] = None
+    attention_quota_released: Optional[bool] = None
+    selected_by_attention_count: Optional[int] = None
+    attention_only_token_count: Optional[int] = None
+    attention_selected_by_final_count: Optional[int] = None
+    attention_top_count: Optional[int] = None
+    # P16: Safe-drop diagnostics (post-hoc computed)
+    safe_drop_candidate_count: Optional[int] = None
+    high_attention_low_geometry_count: Optional[int] = None
+    high_geometry_low_attention_count: Optional[int] = None
+    # VLA-Pruner-style post-pruning sequence handling
+    position_preserve_enabled: Optional[bool] = None
+    position_preserve_applied: Optional[bool] = None
+    position_preserve_reason: Optional[str] = None
+    position_preserve_original_visual_tokens: Optional[int] = None
+    position_preserve_kept_visual_tokens: Optional[int] = None
+    position_preserve_text_tokens: Optional[int] = None
+    position_preserve_prefill_seq_len: Optional[int] = None
+    position_preserve_original_seq_len: Optional[int] = None
+    position_preserve_max_position_id: Optional[int] = None
+    position_preserve_decode_tokens: Optional[int] = None
+    pruning_info_recorded: Optional[bool] = None
+    pruning_info_kept_indices_count: Optional[int] = None
+    pruning_info_pruned_indices_count: Optional[int] = None
+    compression_backend: Optional[str] = None
+    projector_pruning_applied: Optional[bool] = None
+    internal_pruning_requested: Optional[bool] = None
+    internal_pruning_plan_ready: Optional[bool] = None
+    internal_pruning_applied: Optional[bool] = None
+    internal_pruning_layer: Optional[int] = None
+    internal_pruning_disabled_reason: Optional[str] = None
+    internal_backend_error: Optional[str] = None
+    internal_original_seq_length: Optional[int] = None
+    internal_kept_seq_length: Optional[int] = None
+    internal_pruned_seq_length: Optional[int] = None
+    internal_original_visual_tokens: Optional[int] = None
+    internal_kept_visual_tokens: Optional[int] = None
+    internal_pruned_visual_tokens: Optional[int] = None
+    visual_tokens_at_llm_entry: Optional[int] = None
+    visual_tokens_after_internal_prune: Optional[int] = None
+    internal_trace_enabled: Optional[bool] = None
+    internal_total_layers: Optional[int] = None
+    internal_first_short_layer: Optional[int] = None
+    internal_full_length_layer_count: Optional[int] = None
+    internal_shortened_layer_count: Optional[int] = None
+    internal_post_prune_layer_count: Optional[int] = None
+    internal_post_prune_layer_ratio: Optional[float] = None
+    prefill_seq_len_before_layer: Optional[Any] = None
+    prefill_seq_len_after_layer: Optional[Any] = None
+    prefill_kv_cache_seq_len_by_layer: Optional[Any] = None
+    internal_kv_cache_full_length_layer_count: Optional[int] = None
+    internal_kv_cache_short_length_layer_count: Optional[int] = None
+    internal_kv_cache_token_reduction_ratio: Optional[float] = None
+    internal_kv_cache_mean_seq_len: Optional[float] = None
+    internal_decode_calls: Optional[int] = None
+    internal_decode_cache_consistent: Optional[bool] = None
+    internal_decode_cache_consistent_by_layer: Optional[bool] = None
+    decode_cache_seq_len_before_by_layer: Optional[Any] = None
+    decode_cache_seq_len_after_by_layer: Optional[Any] = None
+    decode_effective_kv_tokens_mean: Optional[float] = None
+    decode_short_cache_layer_count: Optional[int] = None
+    decode_pruned_cache_layer_count: Optional[int] = None
+    internal_selection_mode: Optional[str] = None
+    internal_attention_enabled: Optional[bool] = None
+    internal_attention_available: Optional[bool] = None
+    internal_attention_source: Optional[str] = None
+    internal_attention_confidence: Optional[float] = None
+    internal_historical_action_attention_available: Optional[bool] = None
+    internal_historical_action_attention_source: Optional[str] = None
+    internal_geo_attention_iou: Optional[float] = None
+    internal_high_geometry_low_attention_count: Optional[int] = None
+    internal_high_attention_low_geometry_count: Optional[int] = None
+    internal_attention_dropped_geo_count: Optional[int] = None
+    internal_pruned_geo_critical_count: Optional[int] = None
+    internal_geo_protected_count: Optional[int] = None
+    internal_geo_explicit_protected_count: Optional[int] = None
+    internal_geo_explicit_protected_kept_count: Optional[int] = None
+    internal_budget_raised_for_geo_protection: Optional[bool] = None
+    internal_dynamic_risk: Optional[float] = None
+    internal_dynamic_risk_level: Optional[str] = None
+    internal_dynamic_keep_ratio: Optional[float] = None
+    internal_dynamic_keep_k: Optional[int] = None
+    internal_quota_hard_k: Optional[int] = None
+    internal_quota_semantic_attention_k: Optional[int] = None
+    internal_quota_historical_attention_k: Optional[int] = None
+    internal_selected_by_geo_count: Optional[int] = None
+    internal_selected_by_semantic_attention_count: Optional[int] = None
+    internal_selected_by_historical_attention_count: Optional[int] = None
+    internal_selected_by_fill_count: Optional[int] = None
+    internal_selected_by_fallback_count: Optional[int] = None
+    internal_fallback_added_count: Optional[int] = None
+    internal_attention_requires_geometry_alignment: Optional[bool] = None
+
+    def to_eval_stats(self) -> Dict[str, Any]:
+        data = asdict(self)
+        timing = data.pop("timing")
+        data.update(timing)
+        data["hook_total_time_ms"] = data.get("hook_total_ms")
+        data["hook_overhead_ms"] = data.get("hook_total_ms")
+        data["token_mapping_time_ms"] = data.get("token_mapping_ms")
+        data["geometry_score_time_ms"] = data.get("score_compute_ms")
+        data["hybrid_score_mean"] = data.get("final_hybrid_score_mean")
+        data["hybrid_score_max"] = data.get("final_hybrid_score_max")
+        data["hybrid_score_std"] = data.get("final_hybrid_score_std")
+        if data.get("actual_keep_ratio") is None:
+            data["actual_keep_ratio"] = data.get("keep_ratio")
+        if data.get("requested_keep_ratio") is None:
+            data["requested_keep_ratio"] = data.get("keep_ratio")
+        if data.get("effective_keep_count") is None:
+            data["effective_keep_count"] = data.get("num_visual_tokens_kept")
+        if data.get("original_token_count") is None:
+            data["original_token_count"] = data.get("num_visual_tokens_original")
+        projector_original = data.get("num_visual_tokens_original")
+        projector_kept = data.get("num_visual_tokens_kept")
+        if data.get("compression_backend") == "internal":
+            projector_kept = projector_original
+        internal_original = data.get("internal_original_visual_tokens")
+        internal_kept = data.get("internal_kept_visual_tokens")
+        if data.get("projector_retention") is None and projector_original:
+            data["projector_retention"] = projector_kept / projector_original if projector_kept is not None else None
+        if data.get("internal_retention") is None and internal_original:
+            data["internal_retention"] = internal_kept / internal_original if internal_kept is not None else None
+        if data.get("compression_backend") == "internal" and data.get("internal_retention") is not None:
+            data["effective_retention"] = data.get("internal_retention")
+            data["effective_keep_count"] = internal_kept
+            data["original_token_count"] = internal_original
+            data["effective_visual_tokens_for_llm"] = internal_kept
+        elif data.get("effective_retention") is None and data.get("original_token_count"):
+            data["effective_retention"] = data.get("effective_keep_count") / data.get("original_token_count") if data.get("effective_keep_count") is not None else None
+            data["effective_visual_tokens_for_llm"] = data.get("effective_keep_count")
+        elif data.get("effective_visual_tokens_for_llm") is None:
+            data["effective_visual_tokens_for_llm"] = data.get("effective_keep_count")
+        active_orig = internal_original if data.get("compression_backend") == "internal" and internal_original is not None else data.get("num_visual_tokens_original")
+        active_kept = internal_kept if data.get("compression_backend") == "internal" and internal_kept is not None else data.get("num_visual_tokens_kept")
+        if data.get("original_visual_tokens") is None:
+            data["original_visual_tokens"] = active_orig
+        if data.get("kept_visual_tokens") is None:
+            data["kept_visual_tokens"] = active_kept
+        if data.get("pruned_visual_tokens") is None and active_orig is not None and active_kept is not None:
+            data["pruned_visual_tokens"] = max(0, active_orig - active_kept)
+        if active_orig:
+            data["retention_actual"] = active_kept / active_orig if active_kept is not None else data.get("retention_actual")
+        text_tokens = data.get("processor_text_tokens")
+        try:
+            text_tokens = int(text_tokens) if text_tokens is not None else None
+        except Exception:
+            text_tokens = None
+        original_seq_estimate = None
+        kept_seq_estimate = None
+        if text_tokens is not None:
+            try:
+                original_seq_estimate = text_tokens + int(active_orig)
+            except Exception:
+                original_seq_estimate = None
+            try:
+                kept_seq_estimate = text_tokens + int(data.get("effective_visual_tokens_for_llm") or active_kept)
+            except Exception:
+                kept_seq_estimate = None
+        seq_before = data.get("internal_original_seq_length")
+        seq_after = data.get("internal_kept_seq_length")
+        if data.get("compression_backend") != "internal":
+            seq_before = (
+                data.get("position_preserve_original_seq_len")
+                or data.get("llm_prefill_seq_len")
+                or original_seq_estimate
+                or seq_before
+            )
+            seq_after = (
+                data.get("position_preserve_prefill_seq_len")
+                or data.get("llm_prefill_seq_len")
+                or kept_seq_estimate
+                or seq_before
+            )
+        if data.get("llm_input_seq_len_before_prune") is None:
+            data["llm_input_seq_len_before_prune"] = seq_before
+        if data.get("llm_input_seq_len_after_prune") is None:
+            data["llm_input_seq_len_after_prune"] = seq_after
+        if data.get("llm_input_seq_len_pruned") is None and seq_before is not None and seq_after is not None:
+            data["llm_input_seq_len_pruned"] = max(0, seq_before - seq_after)
+        if data.get("num_visual_tokens_dropped") is None:
+            data["num_visual_tokens_dropped"] = data.get("num_visual_tokens_pruned")
+        if data.get("num_visual_tokens_original_total") is None:
+            data["num_visual_tokens_original_total"] = data.get("num_visual_tokens_original")
+        if data.get("num_visual_tokens_kept_total") is None:
+            data["num_visual_tokens_kept_total"] = data.get("num_visual_tokens_kept")
+        if data.get("keep_ratio_requested") is None:
+            data["keep_ratio_requested"] = data.get("requested_keep_ratio")
+        if data.get("keep_ratio_actual") is None:
+            data["keep_ratio_actual"] = data.get("actual_keep_ratio")
+        if data.get("retention_actual") is None:
+            data["retention_actual"] = data.get("actual_retention_ratio") or data.get("actual_keep_ratio")
+        if data.get("reserved_edge_dropped_ratio") is None:
+            data["reserved_edge_dropped_ratio"] = data.get("reserved_edge_topk_dropped_ratio")
+        if data.get("non_reserved_topk_count") is None:
+            data["non_reserved_topk_count"] = data.get("non_reserved_edge_topk_count")
+        if data.get("non_reserved_kept_count") is None:
+            data["non_reserved_kept_count"] = data.get("non_reserved_edge_kept_count")
+        if data.get("non_reserved_dropped_count") is None:
+            data["non_reserved_dropped_count"] = data.get("non_reserved_edge_dropped_count")
+        if data.get("non_reserved_dropped_ratio") is None:
+            data["non_reserved_dropped_ratio"] = data.get("non_reserved_edge_topk_dropped_ratio")
+        data["adaptive_threshold_mean"] = data.get("adaptive_threshold_mean")
+        data["adaptive_threshold_max"] = data.get("adaptive_threshold_max")
+        data["ema_used_for_selection"] = data.get("ema_used_for_selection")
+        if data.get("token_mapping_ms") is not None or data.get("score_compute_ms") is not None:
+            data["geometry_total_time_ms"] = (data.get("token_mapping_ms") or 0.0) + (
+                data.get("score_compute_ms") or 0.0
+            )
+        return data
+
+    def to_fast_eval_stats(self) -> Dict[str, Any]:
+        """Return only rollout-critical stats for the ACGTP fast hot path.
+
+        The full dataclass has hundreds of audit fields. Expanding it with
+        dataclasses.asdict() is useful for diagnostics, but it should not sit
+        on the timing-critical projector hook path during speed experiments.
+        """
+        timing = self.timing
+        data: Dict[str, Any] = {
+            "num_visual_tokens_original": self.num_visual_tokens_original,
+            "num_visual_tokens_kept": self.num_visual_tokens_kept,
+            "num_visual_tokens_pruned": self.num_visual_tokens_pruned,
+            "num_visual_tokens_dropped": self.num_visual_tokens_dropped,
+            "num_visual_tokens_original_total": self.num_visual_tokens_original_total,
+            "num_visual_tokens_kept_total": self.num_visual_tokens_kept_total,
+            "protected_token_ratio": self.protected_token_ratio,
+            "pruned_token_ratio": self.pruned_token_ratio,
+            "keep_ratio": self.keep_ratio,
+            "requested_keep_ratio": self.requested_keep_ratio,
+            "actual_keep_ratio": self.actual_keep_ratio,
+            "keep_ratio_requested": self.keep_ratio_requested,
+            "keep_ratio_actual": self.keep_ratio_actual,
+            "retention_actual": self.retention_actual,
+            "effective_keep_count": self.effective_keep_count,
+            "original_token_count": self.original_token_count,
+            "effective_retention": self.effective_retention,
+            "projector_retention": self.projector_retention,
+            "internal_retention": self.internal_retention,
+            "effective_visual_tokens_for_llm": self.effective_visual_tokens_for_llm,
+            "original_visual_tokens": self.original_visual_tokens,
+            "kept_visual_tokens": self.kept_visual_tokens,
+            "pruned_visual_tokens": self.pruned_visual_tokens,
+            "llm_input_seq_len_before_prune": self.llm_input_seq_len_before_prune,
+            "llm_input_seq_len_after_prune": self.llm_input_seq_len_after_prune,
+            "llm_input_seq_len_pruned": self.llm_input_seq_len_pruned,
+            "pruning_strategy": self.pruning_strategy,
+            "pruning_method": self.pruning_method,
+            "keep_ratio_source": self.keep_ratio_source,
+            "fallback_used": self.fallback_used,
+            "fallback_reason": self.fallback_reason,
+            "selector_name": self.selector_name,
+            "selector_function_name": self.selector_function_name,
+            "selection_strategy_name": self.selection_strategy_name,
+            "selection_stage_name": self.selection_stage_name,
+            "selector_success": self.selector_success,
+            "keep_indices_sorted": self.keep_indices_sorted,
+            "keep_indices_unique": self.keep_indices_unique,
+            "keep_indices_out_of_bounds": self.keep_indices_out_of_bounds,
+            "duplicate_indices_count": self.duplicate_indices_count,
+            "depth_source_key": self.depth_source_key,
+            "depth_valid_ratio": self.depth_valid_ratio,
+            "valid_token_ratio": self.valid_token_ratio,
+            "geometry_available": self.geometry_available,
+            "robot_state_available": self.robot_state_available,
+            "camera_available": self.camera_available,
+            "motion_direction_valid": self.motion_direction_valid,
+            "distance_to_gripper_min": self.distance_to_gripper_min,
+            "distance_to_gripper_mean": self.distance_to_gripper_mean,
+            "distance_to_gripper_max": self.distance_to_gripper_max,
+            "mean_near_score": self.mean_near_score,
+            "max_near_score": self.max_near_score,
+            "motion_norm": self.motion_norm,
+            "gripper_pixel_u": self.gripper_pixel_u,
+            "gripper_pixel_v": self.gripper_pixel_v,
+            "gripper_in_bounds": self.gripper_in_bounds,
+            "dynamic_enabled": self.dynamic_enabled,
+            "dynamic_phase": self.dynamic_phase,
+            "dynamic_keep_ratio": self.dynamic_keep_ratio,
+            "dynamic_keep_k": self.dynamic_keep_k,
+            "dynamic_keep_reason": self.dynamic_keep_reason,
+            "geo_risk_level": self.geo_risk_level,
+            "geo_risk_score": self.geo_risk_score,
+            "acgtp_v1": self.acgtp_v1,
+            "acgtp_v2": self.acgtp_v2,
+            "acgtp_ablate_enabled": self.acgtp_ablate_enabled,
+            "acgtp_ablate_branches": self.acgtp_ablate_branches,
+            "acgtp_ablate_scene": self.acgtp_ablate_scene,
+            "acgtp_ablate_depth": self.acgtp_ablate_depth,
+            "acgtp_ablate_contact": self.acgtp_ablate_contact,
+            "acgtp_ablate_motion": self.acgtp_ablate_motion,
+            "acgtp_ablate_fill": self.acgtp_ablate_fill,
+            "acgtp_selector_version": self.acgtp_selector_version,
+            "acgtp_quota_policy": self.acgtp_quota_policy,
+            "acgtp_fill_policy": self.acgtp_fill_policy,
+            "acgtp_action_constraint_ms": self.acgtp_action_constraint_ms,
+            "acgtp_scene_layout_ms": self.acgtp_scene_layout_ms,
+            "acgtp_contact_ring_ms": self.acgtp_contact_ring_ms,
+            "acgtp_motion_corridor_ms": self.acgtp_motion_corridor_ms,
+            "acgtp_static_scene_cache_enabled": self.acgtp_static_scene_cache_enabled,
+            "acgtp_static_scene_cache_hit": self.acgtp_static_scene_cache_hit,
+            "acgtp_static_scene_cache_reason": self.acgtp_static_scene_cache_reason,
+            "acgtp_static_scene_cache_depth_delta": self.acgtp_static_scene_cache_depth_delta,
+            "acgtp_static_scene_cache_valid_iou": self.acgtp_static_scene_cache_valid_iou,
+            "acgtp_static_scene_cache_age": self.acgtp_static_scene_cache_age,
+            "acgtp_latency_plan_cache_enabled": self.acgtp_latency_plan_cache_enabled,
+            "acgtp_latency_plan_cache_hit": self.acgtp_latency_plan_cache_hit,
+            "acgtp_latency_plan_cache_reason": self.acgtp_latency_plan_cache_reason,
+            "acgtp_latency_plan_cache_age": self.acgtp_latency_plan_cache_age,
+            "acgtp_latency_plan_cache_depth_delta": self.acgtp_latency_plan_cache_depth_delta,
+            "acgtp_latency_plan_cache_gripper_delta": self.acgtp_latency_plan_cache_gripper_delta,
+            "acgtp_latency_plan_cache_lookup_ms": self.acgtp_latency_plan_cache_lookup_ms,
+            "acgtp_latency_plan_cache_keep_count": self.acgtp_latency_plan_cache_keep_count,
+            "acgtp_motion_corridor_valid": self.acgtp_motion_corridor_valid,
+            "acgtp_scene_fill_candidate_count": self.acgtp_scene_fill_candidate_count,
+            "acgtp_scene_fill_candidate_ratio": self.acgtp_scene_fill_candidate_ratio,
+            "acgtp_coverage_fill_candidate_count": self.acgtp_coverage_fill_candidate_count,
+            "acgtp_coverage_fill_candidate_ratio": self.acgtp_coverage_fill_candidate_ratio,
+            "acgtp_min_scene_tokens": self.acgtp_min_scene_tokens,
+            "acgtp_min_depth_tokens": self.acgtp_min_depth_tokens,
+            "acgtp_min_contact_tokens": self.acgtp_min_contact_tokens,
+            "acgtp_min_motion_tokens": self.acgtp_min_motion_tokens,
+            "acgtp_constrained_fill_cap_tokens": self.acgtp_constrained_fill_cap_tokens,
+            "acgtp_constrained_fill_cap_applied": self.acgtp_constrained_fill_cap_applied,
+            "selected_by_semantic_count": self.selected_by_semantic_count,
+            "attention_backend": self.attention_backend,
+            "attention_source": self.attention_source,
+            "attention_available": self.attention_available,
+            "attention_confidence": self.attention_confidence,
+            "attention_quota_released": self.attention_quota_released,
+            "selected_by_attention_count": self.selected_by_attention_count,
+            "attention_only_token_count": self.attention_only_token_count,
+            "attention_selected_by_final_count": self.attention_selected_by_final_count,
+            "attention_top_count": self.attention_top_count,
+            "safe_drop_candidate_count": self.safe_drop_candidate_count,
+            "high_attention_low_geometry_count": self.high_attention_low_geometry_count,
+            "high_geometry_low_attention_count": self.high_geometry_low_attention_count,
+            "position_preserve_enabled": self.position_preserve_enabled,
+            "position_preserve_applied": self.position_preserve_applied,
+            "position_preserve_reason": self.position_preserve_reason,
+            "position_preserve_original_visual_tokens": self.position_preserve_original_visual_tokens,
+            "position_preserve_kept_visual_tokens": self.position_preserve_kept_visual_tokens,
+            "position_preserve_text_tokens": self.position_preserve_text_tokens,
+            "position_preserve_prefill_seq_len": self.position_preserve_prefill_seq_len,
+            "position_preserve_original_seq_len": self.position_preserve_original_seq_len,
+            "position_preserve_max_position_id": self.position_preserve_max_position_id,
+            "position_preserve_decode_tokens": self.position_preserve_decode_tokens,
+            "pruning_info_recorded": self.pruning_info_recorded,
+            "pruning_info_kept_indices_count": self.pruning_info_kept_indices_count,
+            "pruning_info_pruned_indices_count": self.pruning_info_pruned_indices_count,
+            "compression_backend": self.compression_backend,
+            "projector_pruning_applied": self.projector_pruning_applied,
+            "internal_pruning_requested": self.internal_pruning_requested,
+            "internal_pruning_plan_ready": self.internal_pruning_plan_ready,
+            "internal_pruning_applied": self.internal_pruning_applied,
+            "internal_pruning_layer": self.internal_pruning_layer,
+            "internal_pruning_disabled_reason": self.internal_pruning_disabled_reason,
+            "internal_backend_error": self.internal_backend_error,
+            "internal_original_seq_length": self.internal_original_seq_length,
+            "internal_kept_seq_length": self.internal_kept_seq_length,
+            "internal_pruned_seq_length": self.internal_pruned_seq_length,
+            "internal_original_visual_tokens": self.internal_original_visual_tokens,
+            "internal_kept_visual_tokens": self.internal_kept_visual_tokens,
+            "internal_pruned_visual_tokens": self.internal_pruned_visual_tokens,
+            "visual_tokens_at_llm_entry": self.visual_tokens_at_llm_entry,
+            "visual_tokens_after_internal_prune": self.visual_tokens_after_internal_prune,
+            "original_visual_tokens": self.original_visual_tokens,
+            "kept_visual_tokens": self.kept_visual_tokens,
+            "pruned_visual_tokens": self.pruned_visual_tokens,
+            "llm_input_seq_len_before_prune": self.llm_input_seq_len_before_prune,
+            "llm_input_seq_len_after_prune": self.llm_input_seq_len_after_prune,
+            "llm_input_seq_len_pruned": self.llm_input_seq_len_pruned,
+            "internal_trace_enabled": self.internal_trace_enabled,
+            "internal_total_layers": self.internal_total_layers,
+            "internal_first_short_layer": self.internal_first_short_layer,
+            "internal_full_length_layer_count": self.internal_full_length_layer_count,
+            "internal_shortened_layer_count": self.internal_shortened_layer_count,
+            "internal_post_prune_layer_count": self.internal_post_prune_layer_count,
+            "internal_post_prune_layer_ratio": self.internal_post_prune_layer_ratio,
+            "prefill_seq_len_before_layer": self.prefill_seq_len_before_layer,
+            "prefill_seq_len_after_layer": self.prefill_seq_len_after_layer,
+            "prefill_kv_cache_seq_len_by_layer": self.prefill_kv_cache_seq_len_by_layer,
+            "internal_kv_cache_full_length_layer_count": self.internal_kv_cache_full_length_layer_count,
+            "internal_kv_cache_short_length_layer_count": self.internal_kv_cache_short_length_layer_count,
+            "internal_kv_cache_token_reduction_ratio": self.internal_kv_cache_token_reduction_ratio,
+            "internal_kv_cache_mean_seq_len": self.internal_kv_cache_mean_seq_len,
+            "internal_decode_calls": self.internal_decode_calls,
+            "internal_decode_cache_consistent": self.internal_decode_cache_consistent,
+            "internal_decode_cache_consistent_by_layer": self.internal_decode_cache_consistent_by_layer,
+            "decode_cache_seq_len_before_by_layer": self.decode_cache_seq_len_before_by_layer,
+            "decode_cache_seq_len_after_by_layer": self.decode_cache_seq_len_after_by_layer,
+            "decode_effective_kv_tokens_mean": self.decode_effective_kv_tokens_mean,
+            "decode_short_cache_layer_count": self.decode_short_cache_layer_count,
+            "decode_pruned_cache_layer_count": self.decode_pruned_cache_layer_count,
+            "internal_selection_mode": self.internal_selection_mode,
+            "internal_attention_enabled": self.internal_attention_enabled,
+            "internal_attention_available": self.internal_attention_available,
+            "internal_attention_source": self.internal_attention_source,
+            "internal_attention_confidence": self.internal_attention_confidence,
+            "internal_historical_action_attention_available": self.internal_historical_action_attention_available,
+            "internal_historical_action_attention_source": self.internal_historical_action_attention_source,
+            "internal_geo_attention_iou": self.internal_geo_attention_iou,
+            "internal_high_geometry_low_attention_count": self.internal_high_geometry_low_attention_count,
+            "internal_high_attention_low_geometry_count": self.internal_high_attention_low_geometry_count,
+            "internal_attention_dropped_geo_count": self.internal_attention_dropped_geo_count,
+            "internal_pruned_geo_critical_count": self.internal_pruned_geo_critical_count,
+            "internal_geo_protected_count": self.internal_geo_protected_count,
+            "internal_geo_explicit_protected_count": self.internal_geo_explicit_protected_count,
+            "internal_geo_explicit_protected_kept_count": self.internal_geo_explicit_protected_kept_count,
+            "internal_budget_raised_for_geo_protection": self.internal_budget_raised_for_geo_protection,
+            "internal_dynamic_risk": self.internal_dynamic_risk,
+            "internal_dynamic_risk_level": self.internal_dynamic_risk_level,
+            "internal_dynamic_keep_ratio": self.internal_dynamic_keep_ratio,
+            "internal_dynamic_keep_k": self.internal_dynamic_keep_k,
+            "internal_quota_hard_k": self.internal_quota_hard_k,
+            "internal_quota_semantic_attention_k": self.internal_quota_semantic_attention_k,
+            "internal_quota_historical_attention_k": self.internal_quota_historical_attention_k,
+            "internal_selected_by_geo_count": self.internal_selected_by_geo_count,
+            "internal_selected_by_semantic_attention_count": self.internal_selected_by_semantic_attention_count,
+            "internal_selected_by_historical_attention_count": self.internal_selected_by_historical_attention_count,
+            "internal_selected_by_fill_count": self.internal_selected_by_fill_count,
+            "internal_selected_by_fallback_count": self.internal_selected_by_fallback_count,
+            "internal_fallback_added_count": self.internal_fallback_added_count,
+            "internal_attention_requires_geometry_alignment": self.internal_attention_requires_geometry_alignment,
+            "effective_visual_tokens_for_llm": self.effective_visual_tokens_for_llm,
+            "selected_by_scene_layout_count": self.selected_by_scene_layout_count,
+            "selected_by_depth_structure_count": self.selected_by_depth_structure_count,
+            "selected_by_contact_ring_count": self.selected_by_contact_ring_count,
+            "selected_by_motion_corridor_count": self.selected_by_motion_corridor_count,
+            "selected_by_constrained_fill_count": self.selected_by_constrained_fill_count,
+            "selected_by_acgtp_fallback_count": self.selected_by_acgtp_fallback_count,
+            "acgtp_branch_accounting_valid": self.acgtp_branch_accounting_valid,
+            "acgtp_branch_sum": self.acgtp_branch_sum,
+            "acgtp_branch_sum_error": self.acgtp_branch_sum_error,
+            "branch_accounting_valid": self.branch_accounting_valid,
+            "branch_sum_equals_kept": self.branch_sum_equals_kept,
+            "acgtp_fallback_used": self.acgtp_fallback_used,
+            "acgtp_fallback_reason": self.acgtp_fallback_reason,
+            "acgtp_dynamic_enabled": self.acgtp_dynamic_enabled,
+            "acgtp_dynamic_phase": self.acgtp_dynamic_phase,
+            "acgtp_dynamic_risk": self.acgtp_dynamic_risk,
+            "acgtp_dynamic_confidence": self.acgtp_dynamic_confidence,
+            "acgtp_dynamic_keep_ratio": self.acgtp_dynamic_keep_ratio,
+            "acgtp_dynamic_keep_k": self.acgtp_dynamic_keep_k,
+            "acgtp_dynamic_base_keep_ratio": self.acgtp_dynamic_base_keep_ratio,
+            "acgtp_dynamic_raw_keep_ratio": self.acgtp_dynamic_raw_keep_ratio,
+            "acgtp_dynamic_phase_min_keep_ratio": self.acgtp_dynamic_phase_min_keep_ratio,
+            "acgtp_dynamic_phase_max_keep_ratio": self.acgtp_dynamic_phase_max_keep_ratio,
+            "acgtp_dynamic_lock_strength": self.acgtp_dynamic_lock_strength,
+            "acgtp_dynamic_uncertainty_boost": self.acgtp_dynamic_uncertainty_boost,
+            "acgtp_dynamic_risk_boost": self.acgtp_dynamic_risk_boost,
+            "acgtp_dynamic_prune_gain": self.acgtp_dynamic_prune_gain,
+            "acgtp_dynamic_keep_reason": self.acgtp_dynamic_keep_reason,
+            "acgtp_dynamic_phase_schedule": self.acgtp_dynamic_phase_schedule,
+            "acgtp_dynamic_branch_floor_enabled": self.acgtp_dynamic_branch_floor_enabled,
+            "acgtp_dynamic_min_scene_tokens": self.acgtp_dynamic_min_scene_tokens,
+            "acgtp_dynamic_min_depth_tokens": self.acgtp_dynamic_min_depth_tokens,
+            "acgtp_dynamic_min_contact_tokens": self.acgtp_dynamic_min_contact_tokens,
+            "acgtp_dynamic_min_motion_tokens": self.acgtp_dynamic_min_motion_tokens,
+            "acgtp_dynamic_fill_cap_ratio": self.acgtp_dynamic_fill_cap_ratio,
+            "acgtp_dynamic_fill_cap_tokens": self.acgtp_dynamic_fill_cap_tokens,
+            "acgtp_dynamic_candidate_phase": self.acgtp_dynamic_candidate_phase,
+            "acgtp_dynamic_previous_phase": self.acgtp_dynamic_previous_phase,
+            "acgtp_dynamic_hysteresis_state": self.acgtp_dynamic_hysteresis_state,
+            "acgtp_dynamic_layout_motion_alignment": self.acgtp_dynamic_layout_motion_alignment,
+            "acgtp_dynamic_binary_alignment": self.acgtp_dynamic_binary_alignment,
+            "acgtp_dynamic_contact_phase_gate": self.acgtp_dynamic_contact_phase_gate,
+            "acgtp_dynamic_contact_peak": self.acgtp_dynamic_contact_peak,
+            "acgtp_dynamic_contact_mean": self.acgtp_dynamic_contact_mean,
+            "acgtp_dynamic_contact_ratio": self.acgtp_dynamic_contact_ratio,
+            "acgtp_dynamic_motion_peak": self.acgtp_dynamic_motion_peak,
+            "acgtp_dynamic_motion_mean": self.acgtp_dynamic_motion_mean,
+            "acgtp_dynamic_motion_ratio": self.acgtp_dynamic_motion_ratio,
+            "acgtp_dynamic_physical_ratio": self.acgtp_dynamic_physical_ratio,
+            "acgtp_dynamic_high_contact": self.acgtp_dynamic_high_contact,
+            "acgtp_dynamic_high_contact_coverage": self.acgtp_dynamic_high_contact_coverage,
+            "acgtp_dynamic_high_contact_legacy": self.acgtp_dynamic_high_contact_legacy,
+            "acgtp_dynamic_shadow_contact_guard": self.acgtp_dynamic_shadow_contact_guard,
+            "acgtp_dynamic_high_motion": self.acgtp_dynamic_high_motion,
+            "acgtp_dynamic_strong_layout": self.acgtp_dynamic_strong_layout,
+            "acgtp_dynamic_action_peak": self.acgtp_dynamic_action_peak,
+            "acgtp_dynamic_action_mean": self.acgtp_dynamic_action_mean,
+            "acgtp_dynamic_depth_valid_ratio": self.acgtp_dynamic_depth_valid_ratio,
+            "acgtp_dynamic_fill_candidate_count": self.acgtp_dynamic_fill_candidate_count,
+            "acgtp_dynamic_fill_candidate_ratio": self.acgtp_dynamic_fill_candidate_ratio,
+            "acgtp_dynamic_candidate_gap_count": self.acgtp_dynamic_candidate_gap_count,
+            "acgtp_dynamic_candidate_gap_ratio": self.acgtp_dynamic_candidate_gap_ratio,
+            "acgtp_dynamic_candidate_clamped": self.acgtp_dynamic_candidate_clamped,
+            "acgtp_dynamic_scene_weight": self.acgtp_dynamic_scene_weight,
+            "acgtp_dynamic_depth_weight": self.acgtp_dynamic_depth_weight,
+            "acgtp_dynamic_contact_weight": self.acgtp_dynamic_contact_weight,
+            "acgtp_dynamic_motion_weight": self.acgtp_dynamic_motion_weight,
+            "acgtp_dynamic_hard_protect_ratio": self.acgtp_dynamic_hard_protect_ratio,
+            "acgtp_dynamic_budget_vector": self.acgtp_dynamic_budget_vector,
+            "acgtp_history_enabled": self.acgtp_history_enabled,
+            "acgtp_history_length_after_update": self.acgtp_history_length_after_update,
+            "acgtp_history_keep_mask_iou": self.acgtp_history_keep_mask_iou,
+            "score_ema_enabled": self.score_ema_enabled,
+            "hook_total_ms": timing.hook_total_ms,
+            "hook_total_time_ms": timing.hook_total_ms,
+            "hook_overhead_ms": timing.hook_total_ms,
+            "token_mapping_ms": timing.token_mapping_ms,
+            "token_mapping_time_ms": timing.token_mapping_ms,
+            "depth_sampling_ms": timing.depth_sampling_ms,
+            "depth_sample_ms": timing.depth_sample_ms,
+            "score_compute_ms": timing.score_compute_ms,
+            "geometry_score_time_ms": timing.score_compute_ms,
+            "depth_edge_score_ms": timing.depth_edge_score_ms,
+            "score_fusion_ms": timing.score_fusion_ms,
+            "selection_ms": timing.selection_ms,
+            "pruning_time_ms": timing.pruning_time_ms,
+            "topk_pruning_ms": timing.topk_pruning_ms,
+            "gather_ms": timing.gather_ms,
+        }
+        projector_original = data.get("num_visual_tokens_original")
+        projector_kept = data.get("num_visual_tokens_kept")
+        if data.get("compression_backend") == "internal":
+            projector_kept = projector_original
+        internal_original = data.get("internal_original_visual_tokens")
+        internal_kept = data.get("internal_kept_visual_tokens")
+        if data.get("projector_retention") is None and projector_original:
+            data["projector_retention"] = projector_kept / projector_original if projector_kept is not None else None
+        if data.get("internal_retention") is None and internal_original:
+            data["internal_retention"] = internal_kept / internal_original if internal_kept is not None else None
+        if data.get("compression_backend") == "internal" and data.get("internal_retention") is not None:
+            data["effective_retention"] = data.get("internal_retention")
+            data["effective_keep_count"] = internal_kept
+            data["original_token_count"] = internal_original
+            data["effective_visual_tokens_for_llm"] = internal_kept
+        elif data.get("effective_retention") is None and data.get("original_token_count"):
+            data["effective_retention"] = data.get("effective_keep_count") / data.get("original_token_count") if data.get("effective_keep_count") is not None else None
+            data["effective_visual_tokens_for_llm"] = data.get("effective_keep_count")
+        elif data.get("effective_visual_tokens_for_llm") is None:
+            data["effective_visual_tokens_for_llm"] = data.get("effective_keep_count")
+        active_orig = internal_original if data.get("compression_backend") == "internal" and internal_original is not None else data.get("num_visual_tokens_original")
+        active_kept = internal_kept if data.get("compression_backend") == "internal" and internal_kept is not None else data.get("num_visual_tokens_kept")
+        if data.get("original_visual_tokens") is None:
+            data["original_visual_tokens"] = active_orig
+        if data.get("kept_visual_tokens") is None:
+            data["kept_visual_tokens"] = active_kept
+        if data.get("pruned_visual_tokens") is None and active_orig is not None and active_kept is not None:
+            data["pruned_visual_tokens"] = max(0, active_orig - active_kept)
+        if active_orig:
+            data["retention_actual"] = active_kept / active_orig if active_kept is not None else data.get("retention_actual")
+        text_tokens = data.get("processor_text_tokens")
+        try:
+            text_tokens = int(text_tokens) if text_tokens is not None else None
+        except Exception:
+            text_tokens = None
+        original_seq_estimate = None
+        kept_seq_estimate = None
+        if text_tokens is not None:
+            try:
+                original_seq_estimate = text_tokens + int(active_orig)
+            except Exception:
+                original_seq_estimate = None
+            try:
+                kept_seq_estimate = text_tokens + int(data.get("effective_visual_tokens_for_llm") or active_kept)
+            except Exception:
+                kept_seq_estimate = None
+        seq_before = data.get("internal_original_seq_length")
+        seq_after = data.get("internal_kept_seq_length")
+        if data.get("compression_backend") != "internal":
+            seq_before = (
+                data.get("position_preserve_original_seq_len")
+                or data.get("llm_prefill_seq_len")
+                or original_seq_estimate
+                or seq_before
+            )
+            seq_after = (
+                data.get("position_preserve_prefill_seq_len")
+                or data.get("llm_prefill_seq_len")
+                or kept_seq_estimate
+                or seq_before
+            )
+        if data.get("llm_input_seq_len_before_prune") is None:
+            data["llm_input_seq_len_before_prune"] = seq_before
+        if data.get("llm_input_seq_len_after_prune") is None:
+            data["llm_input_seq_len_after_prune"] = seq_after
+        if data.get("llm_input_seq_len_pruned") is None and seq_before is not None and seq_after is not None:
+            data["llm_input_seq_len_pruned"] = max(0, seq_before - seq_after)
+        if data.get("num_visual_tokens_dropped") is None and self.num_visual_tokens_pruned is not None:
+            data["num_visual_tokens_dropped"] = self.num_visual_tokens_pruned
+        if data.get("num_visual_tokens_original_total") is None:
+            data["num_visual_tokens_original_total"] = self.num_visual_tokens_original
+        if data.get("num_visual_tokens_kept_total") is None:
+            data["num_visual_tokens_kept_total"] = self.num_visual_tokens_kept
+        if timing.token_mapping_ms is not None or timing.score_compute_ms is not None:
+            data["geometry_total_time_ms"] = (timing.token_mapping_ms or 0.0) + (timing.score_compute_ms or 0.0)
+        return data
+
+
+class PerfTimer:
+    def __init__(self) -> None:
+        self.start = time.perf_counter()
+
+    def ms(self) -> float:
+        return (time.perf_counter() - self.start) * 1000.0

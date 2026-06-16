@@ -1,0 +1,60 @@
+# ==============================================================================
+# OpenVLA Baseline Evaluation Configuration
+# ==============================================================================
+
+# --- Model Configuration ---
+# Path to the OpenVLA checkpoint (local or HuggingFace repo id)
+model_path: "/infini-data/checkpoints/openvla-7b-finetuned-libero-spatial"
+
+# Load quantization (set only ONE to True)
+load_in_8bit: false
+load_in_4bit: false
+
+# Use Flash Attention 2 (recommended for A100/H100; disable on older GPUs)
+use_flash_attention: true
+
+# Center crop at inference (set True if model was fine-tuned with image augmentation)
+center_crop: true
+
+# --- Task / Environment Configuration ---
+# LIBERO task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+task_suite: "libero_spatial"
+
+# Number of episodes (rollouts) per task
+num_episodes: 10
+
+# Maximum steps per episode (will be overridden by task-specific limits if not set)
+max_steps: 220
+
+# Number of initial "do nothing" steps to let objects settle in simulation
+num_steps_wait: 10
+
+# --- Runtime Configuration ---
+# Random seed for reproducibility
+seed: 7
+
+# Device: "cuda" or "cpu"
+device: "cuda"
+
+# Precision: "bfloat16", "float16", or "float32"
+precision: "bfloat16"
+
+# Dry-run mode (uses synthetic images; no simulation required)
+dry_run: false
+
+# --- Output Configuration ---
+# Directory where evaluation results are saved
+save_dir: "outputs/openvla_baseline_eval"
+
+# Log per-step metrics (increases I/O overhead; set False for large-scale eval)
+log_step_metrics: true
+
+# Log to Weights & Biases (requires wandb login)
+use_wandb: false
+wandb_project: "openvla_baseline_eval"
+wandb_entity: null
+
+# --- Extension Fields (for future token pruning / geometric expert) ---
+# Currently all set to baseline values; will be overridden when pruning is added
+pruning_mode: "none"
+keep_ratio: 1.0

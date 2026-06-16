@@ -1,0 +1,1226 @@
+"""Fast ACGTP runtime path for VisualTokenPruningHook."""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+
+from ..signals.temporal import decide_acgtp_dynamic_budget
+from ..signals.action import compute_future_action_constraint_scores
+from ..signals.spatial import compute_contact_ring_scores
+from ..signals.spatial import compute_depth_edge_scores, compute_valid_depth_mask
+from ..internal.quota_config import build_internal_quota_config
+from ..core.metrics import HookMetrics
+from ..signals.action import compute_motion_corridor_scores, create_motion_buffer
+from ..signals.robot import (
+    extract_gripper_position,
+    extract_robot_camera_transform,
+    project_tokens_to_robot,
+)
+from ..signals.spatial import compute_scene_layout_scores
+from ..methods.acgtp_v2 import select_acgtp_v2_fast
+
+
+class HookFastRuntimeMixin:
+    def _acgtp_fast_runtime_enabled(self) -> bool:
+        """Return True when ACGTP-v2 should use the lean rollout hot path."""
+        semantic_active = (
+            bool(getattr(self.config, "acgtp_v2_semantic_enabled", False))
+            and str(getattr(self.config, "acgtp_v2_semantic_backend", "none")) != "none"
+        )
+        debug_visual = any(
+            bool(self.cfg.get(key, False))
+            for key in (
+                "save_pruning_vis",
+                "save_pruning_debug",
+                "save_token_selection_debug",
+            )
+        )
+        return (
+            self.config.strategy == "robot_geo_acgtp_v2"
+            and self._is_fast_runtime()
+            and bool(getattr(self.config, "acgtp_fast_selector_enabled", True))
+            and not bool(getattr(self.config, "acgtp_full_diagnostics_enabled", False))
+            and not semantic_active
+            and not debug_visual
+            and not bool(getattr(self.config, "enable_geo_debug", False))
+        )
+
+    def _finalize_acgtp_fast_runtime(
+        self,
+        *,
+        visual_tokens: torch.Tensor,
+        metrics: HookMetrics,
+        keep_indices_np: np.ndarray,
+        selection_meta: Dict[str, Any],
+        robot_metrics: Dict[str, Any],
+        num_tokens: int,
+        geometry_payload: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, HookMetrics]:
+        """Minimal ACGTP-v2 hot-path finalization.
+
+        This deliberately skips full attribution/accounting recomputation. The
+        selector already returns lightweight branch counts, while detailed
+        audits remain available through acgtp_full_diagnostics_enabled=True.
+        """
+        idx = np.asarray(keep_indices_np, dtype=np.int64).reshape(-1)
+        idx = idx[(idx >= 0) & (idx < int(num_tokens))]
+        if idx.size == 0:
+            idx = np.arange(int(num_tokens), dtype=np.int64)
+            selection_meta["fallback_used"] = True
+            selection_meta["fallback_reason"] = selection_meta.get("fallback_reason") or "fast_runtime_empty_indices"
+        else:
+            idx = np.sort(np.unique(idx)).astype(np.int64, copy=False)
+
+        selector_ms = selection_meta.get("selection_time_ms")
+        try:
+            selector_ms = float(selector_ms) if selector_ms is not None else None
+        except Exception:
+            selector_ms = None
+        metrics.timing.selection_ms = selector_ms
+        metrics.timing.pruning_time_ms = selector_ms
+        metrics.timing.topk_pruning_ms = selector_ms
+
+        internal_mode = self._internal_pruning_requested()
+        if internal_mode:
+            self._prepare_internal_pruning_plan(
+                keep_indices_np=idx,
+                num_tokens=int(num_tokens),
+                metrics=metrics,
+                selection_meta=selection_meta,
+                geometry_payload=geometry_payload,
+                target_keep_ratio=float(selection_meta.get("acgtp_dynamic_keep_ratio") or selection_meta.get("requested_keep_ratio") or (idx.size / max(1, int(num_tokens)))),
+                quota_config=(geometry_payload or {}).get("quota_config") if isinstance(geometry_payload, dict) else None,
+            )
+            metrics.timing.gather_ms = 0.0
+            pruned = visual_tokens
+            kept = int(idx.size)
+        else:
+            gather_start = time.perf_counter()
+            keep_indices = torch.as_tensor(idx, dtype=torch.long, device=visual_tokens.device)
+            pruned = visual_tokens.index_select(dim=1, index=keep_indices)
+            metrics.timing.gather_ms = (time.perf_counter() - gather_start) * 1000.0
+            kept = int(pruned.shape[1])
+            metrics.compression_backend = "projector"
+            metrics.projector_pruning_applied = bool(kept < int(num_tokens))
+            metrics.internal_pruning_requested = False
+            metrics.internal_pruning_plan_ready = False
+            metrics.internal_pruning_applied = False
+
+        actual_ratio = kept / int(num_tokens) if num_tokens else 1.0
+        metrics.num_visual_tokens_kept = kept
+        metrics.num_visual_tokens_pruned = int(num_tokens) - kept
+        metrics.num_visual_tokens_dropped = int(num_tokens) - kept
+        metrics.num_visual_tokens_original_total = int(num_tokens)
+        metrics.num_visual_tokens_kept_total = kept
+        metrics.selected_token_count = kept
+        metrics.dropped_token_count = int(num_tokens) - kept
+        metrics.selected_token_ratio = actual_ratio
+        metrics.dropped_token_ratio = 1.0 - actual_ratio
+        metrics.retention_ratio = actual_ratio
+        metrics.keep_ratio = actual_ratio
+        metrics.actual_keep_ratio = actual_ratio
+        metrics.keep_ratio_actual = actual_ratio
+        metrics.retention_actual = actual_ratio
+        metrics.actual_retention_ratio = actual_ratio
+        metrics.effective_keep_count = kept
+        metrics.original_token_count = int(num_tokens)
+        metrics.protected_token_ratio = actual_ratio
+        metrics.pruned_token_ratio = 1.0 - actual_ratio
+        metrics.keep_indices_count = kept
+        metrics.keep_indices_sorted = True
+        metrics.keep_indices_unique = True
+        metrics.keep_indices_out_of_bounds = False
+        metrics.duplicate_indices_count = 0
+        metrics.no_duplicate_final_indices = True
+        metrics.final_indices_sorted = True
+        metrics.selected_token_count_equals_kept = True
+        metrics.retention_ratio_valid = True
+        if not internal_mode:
+            self._prepare_position_preserve_info(
+                keep_indices_np=idx,
+                num_tokens=int(num_tokens),
+                metrics=metrics,
+            )
+
+        metrics.selector_name = selection_meta.get("selector_name", "select_acgtp_v2_fast")
+        metrics.selector_function_name = selection_meta.get("selector_function_name", "select_acgtp_v2_fast")
+        metrics.selection_strategy_name = selection_meta.get("selection_strategy_name", self.config.strategy)
+        metrics.selection_stage_name = selection_meta.get("selection_stage_name", "acgtp_v2_fast_runtime")
+        metrics.selector_success = True
+        metrics.requested_pruning_strategy = self.config.strategy
+        metrics.effective_pruning_strategy = self.config.strategy
+        metrics.keep_indices_source = metrics.selector_function_name
+        metrics.keep_ratio_source = metrics.keep_ratio_source or "acgtp_dynamic_controller"
+        metrics.keep_ratio_requested = selection_meta.get("requested_keep_ratio", metrics.requested_keep_ratio)
+
+        metrics.fallback_used = bool(selection_meta.get("fallback_used", False))
+        metrics.fallback_reason = selection_meta.get("fallback_reason")
+        metrics.acgtp_v2 = True
+        metrics.acgtp_v1 = False
+        metrics.acgtp_selector_version = selection_meta.get("acgtp_selector_version")
+        metrics.acgtp_quota_policy = selection_meta.get("acgtp_quota_policy")
+        metrics.acgtp_fill_policy = selection_meta.get("acgtp_fill_policy")
+        metrics.acgtp_fallback_used = bool(selection_meta.get("acgtp_fallback_used", False))
+        metrics.acgtp_fallback_reason = selection_meta.get("acgtp_fallback_reason")
+        metrics.acgtp_branch_accounting_valid = selection_meta.get("acgtp_branch_accounting_valid")
+        metrics.acgtp_branch_sum = selection_meta.get("acgtp_branch_sum")
+        metrics.acgtp_branch_sum_error = selection_meta.get("acgtp_branch_sum_error")
+        metrics.branch_accounting_valid = selection_meta.get("branch_accounting_valid")
+        metrics.branch_sum_equals_kept = selection_meta.get("branch_sum_equals_kept")
+        metrics.selected_by_scene_layout_count = selection_meta.get("selected_by_scene_layout_count")
+        metrics.selected_by_depth_structure_count = selection_meta.get("selected_by_depth_structure_count")
+        metrics.selected_by_contact_ring_count = selection_meta.get("selected_by_contact_ring_count")
+        metrics.selected_by_motion_corridor_count = selection_meta.get("selected_by_motion_corridor_count")
+        metrics.selected_by_constrained_fill_count = selection_meta.get("selected_by_constrained_fill_count")
+        metrics.selected_by_acgtp_fallback_count = selection_meta.get("selected_by_acgtp_fallback_count")
+        metrics.acgtp_actual_keep_ratio = actual_ratio
+        metrics.acgtp_final_kept = kept
+        metrics.acgtp_expected_kept = selection_meta.get("expected_kept", kept)
+        metrics.acgtp_action_constraint_ms = robot_metrics.get("acgtp_action_constraint_ms")
+        metrics.acgtp_motion_corridor_valid = robot_metrics.get("acgtp_motion_corridor_valid")
+        metrics.acgtp_scene_fill_candidate_count = selection_meta.get("acgtp_scene_fill_candidate_count")
+        metrics.acgtp_scene_fill_candidate_ratio = selection_meta.get("acgtp_scene_fill_candidate_ratio")
+        metrics.acgtp_coverage_fill_candidate_count = selection_meta.get("acgtp_coverage_fill_candidate_count")
+        metrics.acgtp_coverage_fill_candidate_ratio = selection_meta.get("acgtp_coverage_fill_candidate_ratio")
+        metrics.acgtp_latency_plan_cache_enabled = selection_meta.get("acgtp_latency_plan_cache_enabled")
+        metrics.acgtp_latency_plan_cache_hit = selection_meta.get("acgtp_latency_plan_cache_hit")
+        metrics.acgtp_latency_plan_cache_reason = selection_meta.get("acgtp_latency_plan_cache_reason")
+        metrics.acgtp_latency_plan_cache_age = selection_meta.get("acgtp_latency_plan_cache_age")
+        metrics.acgtp_latency_plan_cache_depth_delta = selection_meta.get("acgtp_latency_plan_cache_depth_delta")
+        metrics.acgtp_latency_plan_cache_gripper_delta = selection_meta.get("acgtp_latency_plan_cache_gripper_delta")
+        metrics.acgtp_latency_plan_cache_lookup_ms = selection_meta.get("acgtp_latency_plan_cache_lookup_ms")
+        metrics.acgtp_latency_plan_cache_keep_count = selection_meta.get("acgtp_latency_plan_cache_keep_count")
+
+        if self._is_audit_runtime():
+            for key in (
+                "acgtp_dynamic_enabled",
+                "acgtp_dynamic_phase",
+                "acgtp_dynamic_phase_schedule",
+                "acgtp_dynamic_candidate_phase",
+                "acgtp_dynamic_previous_phase",
+                "acgtp_dynamic_hysteresis_state",
+                "acgtp_dynamic_risk",
+                "acgtp_dynamic_confidence",
+                "acgtp_dynamic_keep_ratio",
+                "acgtp_dynamic_keep_k",
+                "acgtp_dynamic_base_keep_ratio",
+                "acgtp_dynamic_raw_keep_ratio",
+                "acgtp_dynamic_phase_min_keep_ratio",
+                "acgtp_dynamic_phase_max_keep_ratio",
+                "acgtp_dynamic_lock_strength",
+                "acgtp_dynamic_uncertainty_boost",
+                "acgtp_dynamic_risk_boost",
+                "acgtp_dynamic_prune_gain",
+                "acgtp_dynamic_keep_reason",
+                "acgtp_dynamic_layout_motion_alignment",
+                "acgtp_dynamic_binary_alignment",
+                "acgtp_dynamic_contact_phase_gate",
+                "acgtp_dynamic_contact_peak",
+                "acgtp_dynamic_contact_mean",
+                "acgtp_dynamic_contact_ratio",
+                "acgtp_dynamic_motion_peak",
+                "acgtp_dynamic_motion_mean",
+                "acgtp_dynamic_motion_ratio",
+                "acgtp_dynamic_physical_ratio",
+                "acgtp_dynamic_high_contact",
+                "acgtp_dynamic_high_contact_coverage",
+                "acgtp_dynamic_high_contact_legacy",
+                "acgtp_dynamic_shadow_contact_guard",
+                "acgtp_dynamic_high_motion",
+                "acgtp_dynamic_strong_layout",
+                "acgtp_dynamic_action_peak",
+                "acgtp_dynamic_action_mean",
+                "acgtp_dynamic_depth_valid_ratio",
+                "acgtp_dynamic_fill_candidate_count",
+                "acgtp_dynamic_fill_candidate_ratio",
+                "acgtp_dynamic_candidate_gap_count",
+                "acgtp_dynamic_candidate_gap_ratio",
+                "acgtp_dynamic_candidate_clamped",
+                "acgtp_dynamic_scene_weight",
+                "acgtp_dynamic_depth_weight",
+                "acgtp_dynamic_contact_weight",
+                "acgtp_dynamic_motion_weight",
+                "acgtp_dynamic_hard_protect_ratio",
+                "acgtp_dynamic_branch_floor_enabled",
+                "acgtp_dynamic_min_scene_tokens",
+                "acgtp_dynamic_min_depth_tokens",
+                "acgtp_dynamic_min_contact_tokens",
+                "acgtp_dynamic_min_motion_tokens",
+                "acgtp_dynamic_fill_cap_ratio",
+                "acgtp_dynamic_fill_cap_tokens",
+                "acgtp_dynamic_budget_vector",
+                "acgtp_min_scene_tokens",
+                "acgtp_min_depth_tokens",
+                "acgtp_min_contact_tokens",
+                "acgtp_min_motion_tokens",
+                "acgtp_constrained_fill_cap_tokens",
+                "acgtp_constrained_fill_cap_applied",
+                "acgtp_static_scene_cache_enabled",
+                "acgtp_static_scene_cache_hit",
+                "acgtp_static_scene_cache_reason",
+                "acgtp_static_scene_cache_depth_delta",
+                "acgtp_static_scene_cache_valid_iou",
+                "acgtp_static_scene_cache_age",
+                "acgtp_ablate_enabled",
+                "acgtp_ablate_branches",
+                "acgtp_ablate_scene",
+                "acgtp_ablate_depth",
+                "acgtp_ablate_contact",
+                "acgtp_ablate_motion",
+                "acgtp_ablate_fill",
+                "attention_backend",
+                "attention_source",
+                "attention_available",
+                "attention_confidence",
+                "attention_quota_released",
+                "selected_by_attention_count",
+                "attention_only_token_count",
+                "attention_selected_by_final_count",
+                "attention_top_count",
+                "safe_drop_candidate_count",
+                "high_attention_low_geometry_count",
+                "high_geometry_low_attention_count",
+            ):
+                if hasattr(metrics, key):
+                    setattr(metrics, key, selection_meta.get(key))
+        metrics.dynamic_enabled = bool(selection_meta.get("acgtp_dynamic_enabled", metrics.dynamic_enabled))
+        metrics.dynamic_phase = selection_meta.get("acgtp_dynamic_phase", metrics.dynamic_phase)
+        metrics.dynamic_keep_ratio = selection_meta.get("acgtp_dynamic_keep_ratio", metrics.dynamic_keep_ratio)
+        metrics.dynamic_keep_k = selection_meta.get("acgtp_dynamic_keep_k", metrics.dynamic_keep_k)
+        metrics.dynamic_keep_reason = selection_meta.get("acgtp_dynamic_keep_reason", metrics.dynamic_keep_reason)
+        metrics.geo_risk_score = selection_meta.get("acgtp_dynamic_risk", metrics.geo_risk_score)
+        metrics.geo_risk_level = selection_meta.get("acgtp_dynamic_phase", metrics.geo_risk_level)
+
+        if bool(getattr(self.config, "acgtp_history_enabled", False)) and not metrics.fallback_used:
+            hist_update = self._acgtp_history.update_after_selection(
+                keep_indices=idx,
+                num_tokens=num_tokens,
+                dynamic_decision=selection_meta,
+                gripper_pos=robot_metrics.get("gripper_pos"),
+            )
+            metrics.acgtp_history_enabled = True
+            metrics.acgtp_history_length_after_update = hist_update.get("acgtp_history_length_after_update")
+            metrics.acgtp_history_keep_mask_iou = hist_update.get("acgtp_history_keep_mask_iou")
+            metrics.acgtp_history_phase_switch = hist_update.get("acgtp_history_phase_switch")
+            metrics.acgtp_history_force_conservative_next = hist_update.get("acgtp_history_force_conservative_next")
+            metrics.acgtp_history_force_conservative_reason = hist_update.get("acgtp_history_force_conservative_reason")
+        else:
+            metrics.acgtp_history_enabled = False
+            metrics.score_ema_enabled = False
+
+        metrics.pruning_result = {
+            "num_tokens_before": int(num_tokens),
+            "num_tokens_after": kept,
+            "actual_keep_ratio": actual_ratio,
+            "method": self.config.strategy,
+            "effective_strategy": self.config.strategy,
+            "fast_runtime": True,
+            "compression_backend": metrics.compression_backend,
+            "projector_pruning_applied": metrics.projector_pruning_applied,
+            "internal_pruning_requested": metrics.internal_pruning_requested,
+            "internal_pruning_plan_ready": metrics.internal_pruning_plan_ready,
+            "selector_function_name": metrics.selector_function_name,
+            "fallback_used": metrics.fallback_used,
+            "fallback_reason": metrics.fallback_reason,
+            "dynamic_phase": metrics.dynamic_phase,
+            "dynamic_keep_k": metrics.dynamic_keep_k,
+            "geo_risk_score": metrics.geo_risk_score,
+            "keep_ratio_source": metrics.keep_ratio_source,
+            "requested_keep_ratio": metrics.requested_keep_ratio,
+        }
+        self._last_selector_exception = None
+        self._last_selector_name = None
+        return pruned, metrics
+
+    @staticmethod
+
+    def _norm01_np(arr: Optional[np.ndarray], n: int, valid: np.ndarray) -> np.ndarray:
+        out = np.zeros(n, dtype=np.float32)
+        if arr is None:
+            return out
+        try:
+            flat = np.asarray(arr, dtype=np.float32).reshape(-1)
+        except Exception:
+            return out
+        if flat.shape[0] != n:
+            return out
+        finite = valid & np.isfinite(flat)
+        if not np.any(finite):
+            return out
+        vals = flat[finite]
+        lo = float(np.min(vals))
+        hi = float(np.max(vals))
+        if hi - lo > 1e-8:
+            out[finite] = (flat[finite] - lo) / (hi - lo)
+        else:
+            out[finite] = np.clip(flat[finite], 0.0, 1.0)
+        out[~valid] = 0.0
+        return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+
+    @staticmethod
+
+    def _topk_np(score: np.ndarray, k: int, eligible: np.ndarray) -> np.ndarray:
+        if k <= 0:
+            return np.asarray([], dtype=np.int64)
+        arr = np.asarray(score, dtype=np.float32).reshape(-1)
+        mask = np.asarray(eligible, dtype=bool).reshape(-1) & np.isfinite(arr) & (arr > 0.0)
+        cand = np.flatnonzero(mask)
+        if cand.size == 0:
+            return np.asarray([], dtype=np.int64)
+        if cand.size > k:
+            cand = cand[np.argpartition(-arr[cand], k - 1)[:k]]
+        order = np.lexsort((cand, -arr[cand]))
+        return cand[order].astype(np.int64, copy=False)
+
+    def _attention_history_ema(self, n: int) -> Optional[np.ndarray]:
+        if not self._acgtp_attention_history:
+            return None
+        decay = float(getattr(self.config, "acgtp_attention_history_decay", 0.8))
+        acc = np.zeros(n, dtype=np.float32)
+        weight_sum = 0.0
+        for i, item in enumerate(reversed(self._acgtp_attention_history)):
+            arr = np.asarray(item, dtype=np.float32).reshape(-1)
+            if arr.shape[0] != n:
+                continue
+            w = float(decay ** i)
+            acc += w * arr
+            weight_sum += w
+        if weight_sum <= 1e-8:
+            return None
+        return np.clip(acc / weight_sum, 0.0, 1.0).astype(np.float32, copy=False)
+
+    def _redundancy_filter_attention_candidates(
+        self,
+        *,
+        visual_tokens: torch.Tensor,
+        candidate_idx: np.ndarray,
+        relevance_score: np.ndarray,
+        budget: int,
+    ) -> np.ndarray:
+        idx = np.asarray(candidate_idx, dtype=np.int64).reshape(-1)
+        if idx.size <= budget or budget <= 0 or not bool(getattr(self.config, "acgtp_attention_redundancy_filter_enabled", True)):
+            return idx[:max(0, budget)]
+        try:
+            score = np.asarray(relevance_score, dtype=np.float32).reshape(-1)
+            if idx.size > 64:
+                order = np.lexsort((idx, -score[idx]))
+                idx = idx[order[:64]]
+            token_idx = torch.as_tensor(idx, dtype=torch.long, device=visual_tokens.device)
+            feats = visual_tokens.detach()[0, token_idx].to(dtype=torch.float32).cpu().numpy()
+            feats = feats / np.maximum(np.linalg.norm(feats, axis=1, keepdims=True), 1e-6)
+            sim = np.clip(feats @ feats.T, -1.0, 1.0)
+            dist = 1.0 - sim
+            rel_np = score[idx]
+            rel_np = rel_np - float(np.min(rel_np))
+            rel_np = rel_np / max(float(np.max(rel_np)), 1e-6)
+            redundancy_weight = float(getattr(self.config, "acgtp_attention_redundancy_weight", 0.35))
+            redundancy_weight = max(0.0, min(1.0, redundancy_weight))
+            selected: List[int] = [int(np.argmax(rel_np))]
+            blocked = np.zeros(idx.size, dtype=bool)
+            blocked[selected[0]] = True
+            while len(selected) < budget:
+                min_dist = np.min(dist[:, np.asarray(selected, dtype=np.int64)], axis=1)
+                combined = (1.0 - redundancy_weight) * rel_np + redundancy_weight * min_dist
+                combined[blocked] = -1.0
+                nxt = int(np.argmax(combined))
+                if bool(blocked[nxt]):
+                    break
+                selected.append(nxt)
+                blocked[nxt] = True
+            return idx[np.asarray(selected, dtype=np.int64)]
+        except Exception:
+            score = np.asarray(relevance_score, dtype=np.float32).reshape(-1)
+            order = np.lexsort((idx, -score[idx]))
+            return idx[order[:budget]]
+
+    def _build_acgtp_attention_guide(
+        self,
+        *,
+        visual_tokens: torch.Tensor,
+        scene_scores: Optional[np.ndarray],
+        depth_scores: Optional[np.ndarray],
+        contact_scores: Optional[np.ndarray],
+        motion_scores: Optional[np.ndarray],
+        action_scores: Optional[np.ndarray],
+        valid_mask: np.ndarray,
+        keep_count: int,
+    ) -> Dict[str, Any]:
+        n = int(valid_mask.shape[0])
+        disabled = {
+            "enabled": False,
+            "score": None,
+            "mask": None,
+            "meta": {
+                "attention_backend": "none",
+                "attention_source": "none",
+                "attention_available": False,
+                "attention_confidence": 0.0,
+                "attention_quota_released": True,
+                "attention_top_count": 0,
+            },
+        }
+        if not bool(getattr(self.config, "acgtp_attention_guidance_enabled", False)) or n <= 0:
+            return disabled
+
+        valid = np.asarray(valid_mask, dtype=bool).reshape(-1)
+        scene = self._norm01_np(scene_scores, n, valid)
+        depth = self._norm01_np(depth_scores, n, valid)
+        contact = self._norm01_np(contact_scores, n, valid)
+        motion = self._norm01_np(motion_scores, n, valid)
+        action = self._norm01_np(action_scores, n, valid)
+
+        source = str(getattr(self.config, "acgtp_attention_guidance_source", "action_proxy")).strip().lower()
+        geometry_proxy = 0.30 * scene + 0.35 * depth + 0.15 * contact + 0.20 * motion
+        if source == "geometry_proxy" or float(np.max(action[valid])) <= 1e-8:
+            current = geometry_proxy
+            source = "geometry_proxy"
+        else:
+            current = 0.70 * action + 0.30 * geometry_proxy
+            source = "action_proxy"
+        current = np.clip(current, 0.0, 1.0).astype(np.float32, copy=False)
+        historical = self._attention_history_ema(n)
+        budget_ratio = float(getattr(self.config, "acgtp_attention_budget_ratio", 0.12))
+        budget = max(1, min(int(keep_count), int(round(float(keep_count) * budget_ratio))))
+
+        current_top = self._topk_np(current, budget, valid)
+        if historical is not None:
+            historical_top = self._topk_np(historical, budget, valid)
+            combined = np.maximum(current, historical)
+            candidate_idx = np.unique(np.concatenate([current_top, historical_top])).astype(np.int64)
+            guide_source = f"{source}+historical_union"
+        else:
+            combined = current
+            candidate_idx = current_top
+            guide_source = f"{source}+current"
+
+        if candidate_idx.size > budget:
+            candidate_idx = self._redundancy_filter_attention_candidates(
+                visual_tokens=visual_tokens,
+                candidate_idx=candidate_idx,
+                relevance_score=combined,
+                budget=budget,
+            )
+
+        mask = np.zeros(n, dtype=np.float32)
+        mask[candidate_idx] = 1.0
+        self._acgtp_attention_history.append(current.copy())
+        confidence = float(np.mean(combined[candidate_idx])) if candidate_idx.size else 0.0
+        return {
+            "enabled": True,
+            "score": combined.astype(np.float32, copy=False),
+            "mask": mask,
+            "meta": {
+                "attention_backend": "proxy",
+                "attention_source": guide_source,
+                "attention_available": bool(candidate_idx.size > 0),
+                "attention_confidence": confidence,
+                "attention_quota_released": not bool(candidate_idx.size > 0),
+                "attention_top_count": int(candidate_idx.size),
+                "acgtp_attention_history_available": historical is not None,
+                "acgtp_attention_current_top_count": int(current_top.size),
+                "acgtp_attention_union_candidate_count": int(candidate_idx.size),
+                "acgtp_attention_redundancy_filter_enabled": bool(getattr(self.config, "acgtp_attention_redundancy_filter_enabled", True)),
+            },
+        }
+
+    def _build_internal_geometry_payload(
+        self,
+        *,
+        scene_scores: np.ndarray,
+        depth_scores: np.ndarray,
+        contact_scores: np.ndarray,
+        motion_scores: np.ndarray,
+        action_scores: np.ndarray,
+        valid_mask: np.ndarray,
+        fill_mask: np.ndarray,
+        keep_count: int,
+        num_tokens: int,
+        motion_valid: bool,
+        dyn_decision: Dict[str, Any],
+        hard_ratio: float,
+        w_scene: float,
+        w_depth: float,
+        w_contact: float,
+        w_motion: float,
+    ) -> Dict[str, Any]:
+        """Package geometry prior for LLM-internal fusion.
+
+        The projector hook keeps doing cheap RGB-D/robot geometry extraction,
+        but in internal mode the final keep decision is made after shallow LLM
+        attention is available.
+        """
+
+        requested_ratio = float(keep_count) / float(max(1, int(num_tokens)))
+        quota_config = build_internal_quota_config(
+            self.config,
+            hard_ratio=hard_ratio,
+            w_scene=w_scene,
+            w_depth=w_depth,
+            w_contact=w_contact,
+            w_motion=w_motion,
+        )
+
+        # Explicit physical hard-protect mask + soft ranking score (final-design
+        # P_geo / geo_soft_score). The hard mask marks tokens that geometrically
+        # constrain the robot's future action: high contact-ring, high future
+        # action-constraint, strong depth/object boundary, or motion corridor.
+        # The internal backend must keep these (raising budget if needed) and the
+        # ordinary redundancy filter must not remove them.
+        valid_arr = np.asarray(valid_mask, dtype=bool).reshape(-1)
+        n = int(valid_arr.shape[0]) if valid_arr.size else int(num_tokens)
+
+        def _norm(arr: np.ndarray) -> np.ndarray:
+            out = self._norm01_np(arr, n, valid_arr)
+            return np.asarray(out, dtype=np.float32).reshape(-1)
+
+        contact_n = _norm(contact_scores)
+        action_n = _norm(action_scores)
+        depth_n = _norm(depth_scores)
+        scene_n = _norm(scene_scores)
+        motion_n = _norm(motion_scores) if motion_valid else np.zeros(n, dtype=np.float32)
+        # Soft ranking score: action-constraint led, geometry-supported. Only for
+        # fill/ordering, never the sole life-or-death signal.
+        geo_soft_score = np.clip(
+            np.maximum.reduce([
+                action_n,
+                0.85 * contact_n,
+                0.70 * depth_n,
+                0.60 * scene_n,
+                0.55 * motion_n,
+            ]),
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        # Execution-function branches for the internal allocator. These keep the
+        # paper-level roles explicit instead of forcing all geometry into one
+        # global salience score.
+        layout_score = np.clip(np.maximum(scene_n, depth_n), 0.0, 1.0).astype(np.float32)
+        contact_score = np.clip(np.maximum(contact_n, action_n), 0.0, 1.0).astype(np.float32)
+        motion_score = np.clip(motion_n, 0.0, 1.0).astype(np.float32)
+        # Hard protect: physically action-constraining tokens above a high
+        # quantile of the strongest constraint evidence (contact/action/motion),
+        # plus object/support boundaries (depth) that coincide with constraint.
+        constraint_evidence = np.maximum.reduce([contact_n, action_n, motion_n]).astype(np.float32)
+        q = float(getattr(self.config, "acgtp_internal_geo_protect_quantile", 0.80))
+        geo_protect_mask = np.zeros(n, dtype=bool)
+        if valid_arr.any():
+            ev_valid = constraint_evidence[valid_arr]
+            ev_valid = ev_valid[np.isfinite(ev_valid)]
+            if ev_valid.size and float(np.max(ev_valid)) > 1e-6:
+                thr = float(np.quantile(ev_valid, q))
+                thr = max(thr, 1e-6)
+                geo_protect_mask = valid_arr & (constraint_evidence >= thr)
+        # Cap the hard set so it can never freeze the whole budget; keep the
+        # strongest-evidence tokens if the quantile selected too many.
+        max_ratio = float(getattr(self.config, "acgtp_internal_geo_protect_max_ratio", 0.50))
+        max_hard = int(max(1, round(float(n) * max_ratio)))
+        if int(geo_protect_mask.sum()) > max_hard:
+            prot_idx = np.flatnonzero(geo_protect_mask)
+            order = prot_idx[np.argsort(-constraint_evidence[prot_idx], kind="stable")]
+            geo_protect_mask = np.zeros(n, dtype=bool)
+            geo_protect_mask[order[:max_hard]] = True
+
+        return {
+            "scene_scores": np.asarray(scene_scores, dtype=np.float32).reshape(-1).copy(),
+            "depth_scores": np.asarray(depth_scores, dtype=np.float32).reshape(-1).copy(),
+            "contact_scores": np.asarray(contact_scores, dtype=np.float32).reshape(-1).copy(),
+            "motion_scores": np.asarray(motion_scores, dtype=np.float32).reshape(-1).copy(),
+            "action_constraint_scores": np.asarray(action_scores, dtype=np.float32).reshape(-1).copy(),
+            "geo_protect_mask": geo_protect_mask.copy(),
+            "geo_soft_score": geo_soft_score.copy(),
+            "layout_score": layout_score.copy(),
+            "contact_score": contact_score.copy(),
+            "motion_score": motion_score.copy(),
+            "valid_mask": np.asarray(valid_mask, dtype=bool).reshape(-1).copy(),
+            "constrained_fill_mask": np.asarray(fill_mask, dtype=bool).reshape(-1).copy(),
+            "motion_corridor_valid": bool(motion_valid),
+            "target_keep_ratio": requested_ratio,
+            "target_keep_k": int(keep_count),
+            "quota_config": quota_config,
+            "dynamic_decision": {k: v for k, v in dict(dyn_decision or {}).items() if not str(k).endswith("_scores")},
+        }
+
+    def _run_acgtp_fast_runtime(
+        self,
+        visual_tokens: torch.Tensor,
+        metrics: HookMetrics,
+        *,
+        keep_count: int,
+        num_tokens: int,
+    ) -> Tuple[torch.Tensor, HookMetrics]:
+        """Lean ACGTP-v2 runtime used for real rollout timing.
+
+        The legacy path below remains the diagnostic/audit path. This hot path
+        avoids torch-based rule-score construction, selected-token attribution,
+        overlay metadata, and full branch audit recomputation.
+        """
+        latest = self.geometry_recorder.get_latest() if self.geometry_recorder is not None else None
+
+        def _fallback(reason: str) -> Tuple[torch.Tensor, HookMetrics]:
+            self._reset_latency_plan_cache()
+            idx = np.arange(int(num_tokens), dtype=np.int64)
+            meta = {
+                "selector_name": "acgtp_fast_input_fallback",
+                "selector_function_name": "acgtp_fast_input_fallback",
+                "selection_strategy_name": "robot_geo_acgtp_v2",
+                "selection_stage_name": "acgtp_v2_fast_input_fallback",
+                "fallback_used": True,
+                "fallback_reason": reason,
+                "acgtp_fallback_used": True,
+                "acgtp_fallback_reason": reason,
+                "acgtp_branch_accounting_valid": True,
+                "acgtp_branch_sum": int(num_tokens),
+                "acgtp_branch_sum_error": 0,
+                "selected_by_scene_layout_count": 0,
+                "selected_by_depth_structure_count": 0,
+                "selected_by_contact_ring_count": 0,
+                "selected_by_motion_corridor_count": 0,
+                "selected_by_constrained_fill_count": 0,
+                "selected_by_acgtp_fallback_count": int(num_tokens),
+                "expected_kept": int(num_tokens),
+            }
+            metrics.fallback_used = True
+            metrics.fallback_reason = reason
+            metrics.keep_ratio_source = "fallback"
+            return self._finalize_acgtp_fast_runtime(
+                visual_tokens=visual_tokens,
+                metrics=metrics,
+                keep_indices_np=idx,
+                selection_meta=meta,
+                robot_metrics={"acgtp_motion_corridor_valid": False},
+                num_tokens=num_tokens,
+            )
+
+        if latest is None:
+            return _fallback("missing_geometry")
+        if latest.depth is None:
+            return _fallback("missing_depth")
+
+        gripper_pos, gripper_key = extract_gripper_position(latest)
+        T_robot_cam, transform_key = extract_robot_camera_transform(latest)
+        if gripper_pos is None:
+            return _fallback("missing_robot_state")
+        if latest.camera_intrinsics is None or T_robot_cam is None:
+            return _fallback("missing_camera")
+
+        meta = self._latest_preprocess_meta
+        if meta is None:
+            from geometry.token_3d_mapper import create_default_preprocess_meta
+
+            meta = create_default_preprocess_meta(
+                original_size=latest.rgb.shape[:2] if latest.rgb is not None else (256, 256),
+                processed_size=(224, 224),
+                center_crop=bool(self.cfg.get("center_crop", True)),
+            )
+
+        token_grid_shape = self._latest_token_grid_shape or self.config.token_grid_shape
+        depth = np.asarray(latest.depth, dtype=np.float32)
+        if depth.ndim == 3:
+            depth = depth[:, :, 0]
+        grip = np.asarray(gripper_pos, dtype=np.float32).reshape(3)
+        depth_source_key = getattr(latest, "depth_metadata", {}) and latest.depth_metadata.get("source_key")
+        plan_cache_probe = self._latency_depth_probe(depth) if self._latency_plan_cache_enabled() else None
+        cached_plan, plan_cache_meta = self._lookup_latency_plan_cache(
+            depth_probe=plan_cache_probe,
+            grip=grip,
+            num_tokens=num_tokens,
+            keep_count=keep_count,
+            token_grid_shape=token_grid_shape,
+        )
+        if cached_plan is not None and bool(plan_cache_meta.get("acgtp_latency_plan_cache_hit")):
+            selection_meta = dict(cached_plan.get("selection_meta") or {})
+            selection_meta.update(plan_cache_meta)
+            selection_meta["selector_name"] = "select_acgtp_v2_fast_cached"
+            selection_meta["selector_function_name"] = "select_acgtp_v2_fast_cached"
+            selection_meta["selection_stage_name"] = "acgtp_v2_latency_plan_cache"
+            selection_meta["selection_time_ms"] = 0.0
+
+            metrics.timing.token_mapping_ms = 0.0
+            metrics.timing.depth_sampling_ms = 0.0
+            metrics.timing.depth_sample_ms = 0.0
+            metrics.timing.score_compute_ms = 0.0
+            metrics.timing.depth_edge_score_ms = 0.0
+            metrics.timing.score_fusion_ms = 0.0
+            metrics.valid_token_ratio = cached_plan.get("valid_ratio")
+            metrics.depth_valid_ratio = cached_plan.get("valid_ratio")
+            metrics.depth_source_key = cached_plan.get("depth_source_key")
+            metrics.geometry_available = True
+            metrics.robot_state_available = True
+            metrics.camera_available = True
+            metrics.acgtp_scene_layout_ms = 0.0
+            metrics.acgtp_contact_ring_ms = 0.0
+            metrics.acgtp_motion_corridor_ms = 0.0
+            metrics.acgtp_action_constraint_ms = 0.0
+            metrics.acgtp_static_scene_cache_enabled = self.config.acgtp_static_scene_cache_enabled
+            metrics.acgtp_static_scene_cache_hit = None
+            metrics.acgtp_static_scene_cache_reason = "skipped_by_latency_plan_cache"
+            self._update_previous_gripper_pos(latest, grip)
+
+            cached_robot_metrics = dict(cached_plan.get("robot_metrics") or {})
+            cached_robot_metrics["gripper_pos"] = grip
+            cached_robot_metrics["acgtp_action_constraint_ms"] = 0.0
+            return self._finalize_acgtp_fast_runtime(
+                visual_tokens=visual_tokens,
+                metrics=metrics,
+                keep_indices_np=np.asarray(cached_plan.get("keep_indices"), dtype=np.int64),
+                selection_meta=selection_meta,
+                robot_metrics=cached_robot_metrics,
+                num_tokens=num_tokens,
+                geometry_payload=cached_plan.get("geometry_payload"),
+            )
+
+        mapping_start = time.perf_counter()
+        cache = self._cache.get(
+            depth.shape[:2],
+            latest.camera_intrinsics,
+            T_robot_cam,
+            meta,
+            token_grid_shape=token_grid_shape,
+            num_visual_tokens=num_tokens,
+            projection_mode=str(self.cfg.get("projection_mode", "current")),
+        )
+        sample_start = time.perf_counter()
+        token_depth = self._cache.sample_depth(depth, cache, check_zbuffer=self._is_audit_runtime())
+        depth_sampling_ms = (time.perf_counter() - sample_start) * 1000.0
+        valid_mask = compute_valid_depth_mask(
+            token_depth,
+            min_depth=self.config.min_depth,
+            max_depth=self.config.max_depth,
+        )
+        valid_ratio = float(np.mean(valid_mask)) if valid_mask.size else 0.0
+        token_mapping_ms = (time.perf_counter() - mapping_start) * 1000.0
+        metrics.timing.token_mapping_ms = token_mapping_ms
+        metrics.timing.depth_sampling_ms = depth_sampling_ms
+        metrics.timing.depth_sample_ms = depth_sampling_ms
+        metrics.valid_token_ratio = valid_ratio
+        metrics.depth_valid_ratio = valid_ratio
+        metrics.depth_source_key = depth_source_key
+
+        if valid_ratio < self.config.min_valid_token_ratio:
+            return _fallback("invalid_depth_ratio")
+
+        score_start = time.perf_counter()
+        token_depth = np.nan_to_num(token_depth, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        p_robot = project_tokens_to_robot(token_depth, cache["rays"], T_robot_cam, valid_mask)
+        distances = np.linalg.norm(p_robot - grip[None, :], axis=1)
+        distances = np.where(np.isfinite(distances), distances, np.inf).astype(np.float32)
+        sigma = max(float(self.config.sigma_near), 1e-6)
+        near_scores = np.exp(-(distances * distances) / (2.0 * sigma * sigma)).astype(np.float32)
+        near_scores[~valid_mask] = 0.0
+        cache_hit, scene_cache_meta = self._static_scene_cache.lookup(
+            token_depth=token_depth,
+            valid_mask=valid_mask,
+            token_grid_shape=token_grid_shape,
+            num_tokens=num_tokens,
+        )
+        if cache_hit:
+            edge_scores = np.asarray(scene_cache_meta["edge_scores"], dtype=np.float32).reshape(-1)
+            scene_result = dict(scene_cache_meta["scene_result"])
+            scene_ms = 0.0
+        else:
+            edge_scores = compute_depth_edge_scores(
+                token_depth,
+                valid_mask,
+                token_grid_shape=token_grid_shape,
+                num_visual_tokens=num_tokens,
+            )
+
+            scene_start = time.perf_counter()
+            scene_result = compute_scene_layout_scores(
+                token_depth=token_depth,
+                valid_mask=valid_mask,
+                token_u=cache.get("u"),
+                token_v=cache.get("v"),
+                support_depth_min=float(self.config.acgtp_scene_support_depth_min),
+                support_depth_max=float(self.config.acgtp_scene_support_depth_max),
+                depth_edge_scores=edge_scores,
+                object_min_area_tokens=int(self.config.acgtp_scene_object_min_area_tokens),
+                object_height_residual_threshold=float(self.config.acgtp_scene_object_height_residual_threshold),
+                grid_h=token_grid_shape[0],
+                grid_w=token_grid_shape[1],
+                support_plane_cap_ratio=float(self.config.acgtp_scene_support_plane_cap_ratio),
+            )
+            scene_ms = (time.perf_counter() - scene_start) * 1000.0
+            self._static_scene_cache.store(
+                token_depth=token_depth,
+                valid_mask=valid_mask,
+                token_grid_shape=token_grid_shape,
+                num_tokens=num_tokens,
+                edge_scores=edge_scores,
+                scene_result=scene_result,
+            )
+        scene_scores = scene_result["scene_layout_scores"]
+        fill_mask = scene_result["scene_fill_candidates"]
+
+        contact_start = time.perf_counter()
+        gripper_pixel = self._project_gripper_to_pixel(grip, latest, T_robot_cam)
+        contact_result = compute_contact_ring_scores(
+            token_u=cache.get("u"),
+            token_v=cache.get("v"),
+            gripper_pixel=gripper_pixel,
+            near_scores=near_scores,
+            self_core_radius_px=float(self.config.acgtp_self_core_radius_px),
+            contact_ring_inner_px=float(self.config.acgtp_contact_ring_inner_px),
+            contact_ring_outer_px=float(self.config.acgtp_contact_ring_outer_px),
+            contact_requires_edge_or_object=bool(self.config.acgtp_contact_requires_edge_or_object),
+            depth_edge_scores=edge_scores,
+        )
+        contact_scores = contact_result["contact_ring_scores"]
+        self_core = contact_result["robot_self_core_mask"]
+        contact_ms = (time.perf_counter() - contact_start) * 1000.0
+
+        motion_start = time.perf_counter()
+        prev_gripper_pos = self._get_previous_gripper_pos(latest)
+        if self._motion_buffer is None and gripper_pos is not None:
+            self._motion_buffer = create_motion_buffer(
+                maxlen=5,
+                ema_alpha=float(self.config.acgtp_motion_ema_alpha),
+            )
+        motion_result = compute_motion_corridor_scores(
+            points_robot=np.asarray(p_robot, dtype=np.float64),
+            gripper_pos=np.asarray(grip, dtype=np.float64),
+            prev_gripper_pos=np.asarray(prev_gripper_pos, dtype=np.float64) if prev_gripper_pos is not None else None,
+            depth_edge_scores=edge_scores,
+            motion_buffer=self._motion_buffer,
+            corridor_length_m=float(self.config.acgtp_motion_corridor_length_m),
+            corridor_sigma_m=float(self.config.acgtp_motion_sigma_m),
+            min_motion_norm=1e-4,
+            ema_alpha=float(self.config.acgtp_motion_ema_alpha),
+        )
+        motion_scores = motion_result["motion_corridor_scores"]
+        motion_valid = bool(motion_result["motion_corridor_valid"])
+        motion_ms = (time.perf_counter() - motion_start) * 1000.0
+
+        ablated = self._parse_acgtp_ablate_branches(getattr(self.config, "acgtp_ablate_branches", ""))
+        ablation_meta: Dict[str, Any] = {
+            "acgtp_ablate_enabled": bool(ablated),
+            "acgtp_ablate_branches": ",".join(sorted(ablated)),
+            "acgtp_ablate_scene": "scene" in ablated,
+            "acgtp_ablate_depth": "depth" in ablated,
+            "acgtp_ablate_contact": "contact" in ablated,
+            "acgtp_ablate_motion": "motion" in ablated,
+            "acgtp_ablate_fill": "fill" in ablated,
+        }
+        if ablated:
+            zeros = np.zeros(num_tokens, dtype=np.float32)
+            if "scene" in ablated:
+                scene_result = dict(scene_result)
+                for key in (
+                    "scene_layout_scores",
+                    "support_plane_scores",
+                    "support_plane_candidate_scores",
+                    "object_component_scores",
+                    "boundary_scores",
+                    "scene_fill_candidates",
+                ):
+                    value = scene_result.get(key)
+                    if value is not None and np.asarray(value).reshape(-1).size == num_tokens:
+                        scene_result[key] = np.zeros_like(np.asarray(value, dtype=np.float32).reshape(-1))
+                scene_scores = zeros.copy()
+                fill_mask = zeros.copy()
+            if "depth" in ablated:
+                edge_scores = zeros.copy()
+            if "contact" in ablated:
+                contact_result = dict(contact_result)
+                contact_scores = zeros.copy()
+                contact_result["contact_ring_scores"] = contact_scores
+                contact_result["contact_ring_mask"] = np.zeros(num_tokens, dtype=bool)
+            if "motion" in ablated:
+                motion_result = dict(motion_result)
+                motion_scores = zeros.copy()
+                motion_result["motion_corridor_scores"] = motion_scores
+                motion_result["motion_corridor_valid"] = False
+                motion_result["motion_disabled_reason"] = "acgtp_branch_ablation"
+                motion_valid = False
+            if "fill" in ablated:
+                fill_mask = zeros.copy()
+
+        acr_start = time.perf_counter()
+        acr_result = compute_future_action_constraint_scores(
+            scene_layout_scores=scene_scores,
+            depth_structure_scores=edge_scores,
+            contact_ring_scores=contact_scores,
+            motion_corridor_scores=motion_scores,
+            valid_mask=valid_mask,
+            robot_self_core_mask=self_core,
+            scene_result=scene_result,
+            contact_result=contact_result,
+            motion_result=motion_result,
+            w_scene=float(self.config.acgtp_w_scene_layout),
+            w_depth=float(self.config.acgtp_w_depth_structure),
+            w_contact=float(self.config.acgtp_w_contact_ring),
+            w_motion=float(self.config.acgtp_w_motion_corridor),
+        )
+        action_scores = acr_result["action_constraint_scores"]
+        acr_ms = (time.perf_counter() - acr_start) * 1000.0
+        score_ms = (time.perf_counter() - score_start) * 1000.0
+
+        self._update_previous_gripper_pos(latest, grip)
+
+        metrics.timing.score_compute_ms = score_ms
+        metrics.timing.depth_edge_score_ms = score_ms
+        metrics.timing.score_fusion_ms = score_ms
+        metrics.acgtp_scene_layout_ms = scene_ms
+        metrics.acgtp_static_scene_cache_enabled = scene_cache_meta.get("acgtp_static_scene_cache_enabled")
+        metrics.acgtp_static_scene_cache_hit = scene_cache_meta.get("acgtp_static_scene_cache_hit")
+        metrics.acgtp_static_scene_cache_reason = scene_cache_meta.get("acgtp_static_scene_cache_reason")
+        metrics.acgtp_static_scene_cache_depth_delta = scene_cache_meta.get("acgtp_static_scene_cache_depth_delta")
+        metrics.acgtp_static_scene_cache_valid_iou = scene_cache_meta.get("acgtp_static_scene_cache_valid_iou")
+        metrics.acgtp_static_scene_cache_age = scene_cache_meta.get("acgtp_static_scene_cache_age")
+        metrics.acgtp_contact_ring_ms = contact_ms
+        metrics.acgtp_motion_corridor_ms = motion_ms
+        metrics.acgtp_action_constraint_ms = acr_ms
+        metrics.geometry_available = True
+        metrics.robot_state_available = True
+        metrics.camera_available = True
+        metrics.depth_edge_score_mean = float(np.mean(edge_scores[valid_mask])) if np.any(valid_mask) else None
+        metrics.mean_near_score = float(np.mean(near_scores[valid_mask])) if np.any(valid_mask) else None
+        metrics.max_near_score = float(np.max(near_scores[valid_mask])) if np.any(valid_mask) else None
+        metrics.motion_norm = motion_result.get("motion_norm_m")
+        metrics.motion_direction_valid = motion_valid
+        metrics.distance_to_gripper_min = float(np.min(distances[valid_mask])) if np.any(valid_mask) else None
+        metrics.distance_to_gripper_mean = float(np.mean(distances[valid_mask])) if np.any(valid_mask) else None
+        metrics.distance_to_gripper_max = float(np.max(distances[valid_mask])) if np.any(valid_mask) else None
+        metrics.transform_source = transform_key
+        metrics.gripper_pixel_u = float(gripper_pixel[0]) if gripper_pixel is not None else None
+        metrics.gripper_pixel_v = float(gripper_pixel[1]) if gripper_pixel is not None else None
+        metrics.gripper_in_bounds = contact_result.get("gripper_in_bounds")
+
+        hist_decision: Dict[str, Any] = {"acgtp_history_enabled": False}
+        if bool(getattr(self.config, "acgtp_history_enabled", False)):
+            try:
+                hist_decision = self._acgtp_history.prepare_step(
+                    scene_scores=scene_scores,
+                    depth_scores=edge_scores,
+                    contact_scores=contact_scores,
+                    motion_scores=motion_scores,
+                    action_scores=action_scores,
+                    valid_mask=valid_mask,
+                    num_tokens=num_tokens,
+                    gripper_pos=grip,
+                    depth_valid_ratio=valid_ratio,
+                )
+                scene_scores = hist_decision.get("scene_scores", scene_scores)
+                edge_scores = hist_decision.get("depth_scores", edge_scores)
+                contact_scores = hist_decision.get("contact_scores", contact_scores)
+                motion_scores = hist_decision.get("motion_scores", motion_scores)
+                action_scores = hist_decision.get("action_scores", action_scores)
+            except Exception as hist_exc:
+                hist_decision = {
+                    "acgtp_history_enabled": False,
+                    "acgtp_history_disabled_reason": f"history_error:{type(hist_exc).__name__}:{str(hist_exc)[:120]}",
+                }
+
+        dyn_decision: Dict[str, Any] = {"acgtp_dynamic_enabled": False}
+        w_scene = float(self.config.acgtp_w_scene_layout)
+        w_depth = float(self.config.acgtp_w_depth_structure)
+        w_contact = float(self.config.acgtp_w_contact_ring)
+        w_motion = float(self.config.acgtp_w_motion_corridor)
+        hard_ratio = float(self.config.acgtp_hard_protect_ratio)
+        if "scene" in ablated:
+            w_scene = 0.0
+        if "depth" in ablated:
+            w_depth = 0.0
+        if "contact" in ablated:
+            w_contact = 0.0
+        if "motion" in ablated:
+            w_motion = 0.0
+        if bool(getattr(self.config, "acgtp_dynamic_enabled", False)):
+            try:
+                dyn_decision = decide_acgtp_dynamic_budget(
+                    scene_layout_scores=scene_scores,
+                    depth_structure_scores=edge_scores,
+                    contact_ring_scores=contact_scores,
+                    motion_corridor_scores=motion_scores,
+                    action_constraint_scores=action_scores,
+                    valid_mask=valid_mask,
+                    constrained_fill_mask=fill_mask,
+                    num_tokens=num_tokens,
+                    base_keep_ratio=float(self.config.keep_ratio),
+                    previous_state=self._acgtp_dynamic_state,
+                    motion_corridor_valid=motion_valid,
+                    motion_norm_m=motion_result.get("motion_norm_m"),
+                    depth_valid_ratio=valid_ratio,
+                    min_keep_ratio=min(
+                        float(self.config.acgtp_dynamic_max_keep_ratio),
+                        max(
+                            float(self.config.acgtp_dynamic_min_keep_ratio),
+                            (
+                                float(self.config.keep_ratio)
+                                if not bool(getattr(self.config, "acgtp_dynamic_allow_below_base_keep_ratio", False))
+                                else float(self.config.acgtp_dynamic_min_keep_ratio)
+                            ),
+                        )
+                        + (
+                            float(self.config.acgtp_history_conservative_keep_boost)
+                            if bool(hist_decision.get("acgtp_history_conservative_mode")) else 0.0
+                        ),
+                    ),
+                    max_keep_ratio=float(self.config.acgtp_dynamic_max_keep_ratio),
+                    risk_boost_scale=float(self.config.acgtp_dynamic_risk_boost_scale),
+                    confidence_prune_scale=float(self.config.acgtp_dynamic_confidence_prune_scale),
+                    contact_phase_gate=str(getattr(self.config, "acgtp_dynamic_contact_phase_gate", "legacy_peak")),
+                    phase_schedule=str(getattr(self.config, "acgtp_dynamic_phase_schedule", "legacy")),
+                    branch_floor_enabled=bool(getattr(self.config, "acgtp_dynamic_branch_floor_enabled", False)),
+                    fill_cap_ratio=float(getattr(self.config, "acgtp_constrained_fill_max_ratio", 1.0)),
+                    respect_phase_min_on_candidate_gap=bool(getattr(self.config, "acgtp_dynamic_respect_phase_min_on_candidate_gap", False)),
+                    shadow_contact_guard_enabled=bool(getattr(self.config, "acgtp_dynamic_shadow_contact_guard_enabled", False)),
+                    shadow_contact_depth_weight_floor=float(getattr(self.config, "acgtp_dynamic_shadow_contact_depth_weight_floor", 0.30)),
+                    shadow_contact_contact_weight_floor=float(getattr(self.config, "acgtp_dynamic_shadow_contact_contact_weight_floor", 0.24)),
+                    shadow_contact_hard_ratio_floor=float(getattr(self.config, "acgtp_dynamic_shadow_contact_hard_ratio_floor", 0.70)),
+                )
+                state = dyn_decision.pop("_state", None)
+                if isinstance(state, dict):
+                    self._acgtp_dynamic_state = state
+                keep_count = max(1, min(num_tokens, int(dyn_decision.get("acgtp_dynamic_keep_k", keep_count))))
+                w_scene = float(dyn_decision.get("acgtp_dynamic_scene_weight", w_scene))
+                w_depth = float(dyn_decision.get("acgtp_dynamic_depth_weight", w_depth))
+                w_contact = float(dyn_decision.get("acgtp_dynamic_contact_weight", w_contact))
+                w_motion = float(dyn_decision.get("acgtp_dynamic_motion_weight", w_motion))
+                hard_ratio = float(dyn_decision.get("acgtp_dynamic_hard_protect_ratio", hard_ratio))
+                if "scene" in ablated:
+                    w_scene = 0.0
+                if "depth" in ablated:
+                    w_depth = 0.0
+                if "contact" in ablated:
+                    w_contact = 0.0
+                if "motion" in ablated:
+                    w_motion = 0.0
+                metrics.keep_ratio_source = "acgtp_dynamic_controller"
+            except Exception as dyn_exc:
+                dyn_decision = {
+                    "acgtp_dynamic_enabled": False,
+                    "acgtp_dynamic_disabled_reason": f"controller_error:{type(dyn_exc).__name__}:{str(dyn_exc)[:120]}",
+                }
+
+        if self._internal_pruning_requested():
+            attention_guide = {
+                "enabled": False,
+                "score": None,
+                "mask": None,
+                "meta": {
+                    "attention_backend": "internal_llm",
+                    "attention_source": "disabled_in_hook_internal_backend_uses_true_attention",
+                    "attention_available": False,
+                    "attention_confidence": 0.0,
+                    "attention_quota_released": True,
+                    "attention_top_count": 0,
+                },
+            }
+        else:
+            attention_guide = self._build_acgtp_attention_guide(
+                visual_tokens=visual_tokens,
+                scene_scores=scene_scores,
+                depth_scores=edge_scores,
+                contact_scores=contact_scores,
+                motion_scores=motion_scores,
+                action_scores=action_scores,
+                valid_mask=valid_mask,
+                keep_count=keep_count,
+            )
+
+        keep_indices_np, selection_meta = select_acgtp_v2_fast(
+            scene_layout_scores=scene_scores,
+            depth_edge_scores=edge_scores,
+            contact_ring_scores=contact_scores,
+            motion_corridor_scores=motion_scores,
+            valid_mask=valid_mask,
+            keep_k=keep_count,
+            constrained_fill_mask=fill_mask,
+            token_u=cache.get("u"),
+            token_v=cache.get("v"),
+            grid_h=token_grid_shape[0],
+            grid_w=token_grid_shape[1],
+            w_scene_layout=w_scene,
+            w_depth_structure=w_depth,
+            w_contact_ring=w_contact,
+            w_motion_corridor=w_motion,
+            w_semantic=0.20,
+            hard_protect_ratio=hard_ratio,
+            motion_corridor_valid=motion_valid,
+            self_core_mask=self_core,
+            contact_ring_inner_px=float(self.config.acgtp_contact_ring_inner_px),
+            contact_ring_outer_px=float(self.config.acgtp_contact_ring_outer_px),
+            contact_requires_edge_or_object=bool(self.config.acgtp_contact_requires_edge_or_object),
+            depth_edge_score_for_gate=edge_scores,
+            action_constraint_scores=action_scores,
+            semantic_enabled=False,
+            semantic_backend="none",
+            semantic_unavailable=True,
+            support_plane_cap_ratio=float(self.config.acgtp_scene_support_plane_cap_ratio),
+            acgtp_attention_enabled=bool(attention_guide.get("enabled", False)),
+            acgtp_attention_backend=str(attention_guide.get("meta", {}).get("attention_backend", "none")),
+            acgtp_attention_task_relevance_score=attention_guide.get("score"),
+            acgtp_attention_task_relevance_mask=attention_guide.get("mask"),
+            acgtp_attention_source=str(attention_guide.get("meta", {}).get("attention_source", "none")),
+            acgtp_attention_available=bool(attention_guide.get("meta", {}).get("attention_available", False)),
+            acgtp_attention_confidence=float(attention_guide.get("meta", {}).get("attention_confidence", 0.0)),
+            acgtp_attention_budget_ratio=float(getattr(self.config, "acgtp_attention_budget_ratio", 0.12)),
+            acgtp_attention_requires_geometry_alignment=bool(getattr(self.config, "acgtp_attention_requires_geometry_alignment", True)),
+            min_scene_tokens=int(dyn_decision.get("acgtp_dynamic_min_scene_tokens", 0) or 0),
+            min_depth_tokens=int(dyn_decision.get("acgtp_dynamic_min_depth_tokens", 0) or 0),
+            min_contact_tokens=int(dyn_decision.get("acgtp_dynamic_min_contact_tokens", 0) or 0),
+            min_motion_tokens=int(dyn_decision.get("acgtp_dynamic_min_motion_tokens", 0) or 0),
+            constrained_fill_max_tokens=(
+                int(dyn_decision.get("acgtp_dynamic_fill_cap_tokens"))
+                if dyn_decision.get("acgtp_dynamic_fill_cap_tokens") is not None
+                else None
+            ),
+            minimal_metadata=True,
+        )
+        selection_meta.update(attention_guide.get("meta", {}))
+        selection_meta.update({k: v for k, v in hist_decision.items() if not k.endswith("_scores") and k not in ("scene_scores", "depth_scores", "contact_scores", "motion_scores", "action_scores")})
+        selection_meta.update(dyn_decision)
+        selection_meta.update(ablation_meta)
+        selection_meta.update(scene_cache_meta)
+        selection_meta.update(plan_cache_meta)
+
+        robot_metrics = {
+            "gripper_pos": grip,
+            "acgtp_action_constraint_ms": acr_ms,
+            "acgtp_motion_corridor_valid": motion_valid,
+        }
+        geometry_payload = self._build_internal_geometry_payload(
+            scene_scores=scene_scores,
+            depth_scores=edge_scores,
+            contact_scores=contact_scores,
+            motion_scores=motion_scores,
+            action_scores=action_scores,
+            valid_mask=valid_mask,
+            fill_mask=fill_mask,
+            keep_count=keep_count,
+            num_tokens=num_tokens,
+            motion_valid=motion_valid,
+            dyn_decision=dyn_decision,
+            hard_ratio=hard_ratio,
+            w_scene=w_scene,
+            w_depth=w_depth,
+            w_contact=w_contact,
+            w_motion=w_motion,
+        )
+        self._store_latency_plan_cache(
+            depth_probe=plan_cache_probe,
+            grip=grip,
+            num_tokens=num_tokens,
+            keep_count=keep_count,
+            token_grid_shape=token_grid_shape,
+            keep_indices_np=keep_indices_np,
+            selection_meta=selection_meta,
+            geometry_payload=geometry_payload,
+            robot_metrics=robot_metrics,
+            valid_ratio=valid_ratio,
+            depth_source_key=depth_source_key,
+        )
+        return self._finalize_acgtp_fast_runtime(
+            visual_tokens=visual_tokens,
+            metrics=metrics,
+            keep_indices_np=keep_indices_np,
+            selection_meta=selection_meta,
+            robot_metrics=robot_metrics,
+            num_tokens=num_tokens,
+            geometry_payload=geometry_payload,
+        )

@@ -1,0 +1,490 @@
+"""Functional quota allocation and merge policy for current ACGTP."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+
+@dataclass
+class InternalQuotaSelectionResult:
+    keep: torch.LongTensor
+    final_mask: torch.Tensor
+    geo_protect_mask: torch.Tensor
+    explicit_protect_mask: torch.Tensor
+    target_k: int
+    target_ratio: float
+    hard_k: int
+    functional_enabled: bool
+    functional_quotas: Dict[str, int]
+    branch_selected_counts: Dict[str, int]
+    branch_unique_counts: Dict[str, int]
+    branch_selected_sum: int
+    branch_unique_sum: int
+    branch_overlap_count: int
+    branch_overlap_ratio: float
+    branch_unique_ratio: float
+    branch_sum_equals_kept: bool
+    fallback_added: int
+    geo_budget_raised: bool
+
+
+def allocate_branch_quotas(total: int, weighted_names: List[Tuple[str, float]]) -> Dict[str, int]:
+    total = max(0, int(total))
+    active = [(name, max(0.0, float(weight))) for name, weight in weighted_names if max(0.0, float(weight)) > 0.0]
+    if total <= 0 or not active:
+        return {name: 0 for name, _ in weighted_names}
+    weight_sum = sum(weight for _, weight in active)
+    raw = [(name, total * weight / weight_sum) for name, weight in active]
+    quotas = {name: int(math.floor(value)) for name, value in raw}
+    used = sum(quotas.values())
+    remainders = sorted(((value - math.floor(value), name) for name, value in raw), reverse=True)
+    for _, name in remainders:
+        if used >= total:
+            break
+        quotas[name] = quotas.get(name, 0) + 1
+        used += 1
+    for name, _ in weighted_names:
+        quotas.setdefault(name, 0)
+    return quotas
+
+
+def topk_indices(score: torch.Tensor, k: int, eligible: torch.Tensor) -> torch.LongTensor:
+    k = int(k)
+    if k <= 0:
+        return torch.empty(0, dtype=torch.long, device=score.device)
+    mask = eligible.bool() & torch.isfinite(score) & (score > 0.0)
+    cand = torch.nonzero(mask, as_tuple=False).reshape(-1)
+    if int(cand.numel()) == 0:
+        return torch.empty(0, dtype=torch.long, device=score.device)
+    if int(cand.numel()) > k:
+        vals = score.index_select(0, cand)
+        top_pos = torch.topk(vals, k=k, largest=True, sorted=False).indices
+        cand = cand.index_select(0, top_pos)
+    vals = score.index_select(0, cand)
+    order = torch.argsort(vals, descending=True)
+    return cand.index_select(0, order).long()
+
+
+def mask_from_indices(indices: torch.Tensor, n: int, device: torch.device) -> torch.Tensor:
+    mask = torch.zeros(n, dtype=torch.bool, device=device)
+    if indices is not None and int(indices.numel()) > 0:
+        mask[indices.long()] = True
+    return mask
+
+
+def count_owner(owners: Dict[int, str], name: str) -> int:
+    return sum(1 for owner in owners.values() if owner == name)
+
+
+def _select_internal_quota_tokens_fast(
+    *,
+    n: int,
+    device: torch.device,
+    valid: torch.Tensor,
+    fill_mask: torch.Tensor,
+    fallback: torch.Tensor,
+    target_k: int,
+    target_ratio: float,
+    hard_k: int,
+    sem_k: int,
+    hist_k: int,
+    sem_ratio: float,
+    hist_ratio: float,
+    requires_geo_alignment: bool,
+    quota_config: Dict[str, object],
+    explicit_protect_mask: torch.Tensor,
+    geo_score: torch.Tensor,
+    layout_score: torch.Tensor,
+    contact_score: torch.Tensor,
+    motion_score: torch.Tensor,
+    sem_score: torch.Tensor,
+    hist_score: torch.Tensor,
+    sem_available: bool,
+    hist_available: bool,
+) -> InternalQuotaSelectionResult:
+    """Latency-oriented functional quota path.
+
+    This keeps the quota/priority policy but avoids per-token Python owner
+    accounting and CPU list conversion. Detailed branch overlap diagnostics
+    remain available through the default audit path.
+    """
+
+    selected = torch.zeros(n, dtype=torch.bool, device=device)
+    branch_selected_counts = {name: 0 for name in ("geo", "layout", "contact", "motion", "sem", "hist", "fill", "fallback")}
+    branch_unique_counts = dict(branch_selected_counts)
+    selected_count = 0
+
+    def add_many(indices: torch.Tensor, owner: str, limit: Optional[int] = None) -> None:
+        nonlocal selected_count
+        if indices is None or int(indices.numel()) <= 0 or selected_count >= target_k:
+            return
+        idx = indices.long().reshape(-1)
+        in_range = (idx >= 0) & (idx < n)
+        if not bool(torch.any(in_range).item()):
+            return
+        idx = idx[in_range]
+        idx = idx[~selected.index_select(0, idx)]
+        if int(idx.numel()) <= 0:
+            return
+        remaining = max(0, int(target_k) - selected_count)
+        take = remaining if limit is None else min(remaining, int(limit))
+        if take <= 0:
+            return
+        idx = idx[:take]
+        selected[idx] = True
+        added = int(idx.numel())
+        selected_count += added
+        branch_selected_counts[owner] = branch_selected_counts.get(owner, 0) + added
+        branch_unique_counts[owner] = branch_unique_counts.get(owner, 0) + added
+
+    protect_idx = torch.nonzero(explicit_protect_mask & valid, as_tuple=False).reshape(-1)
+    explicit_protect_count = int(protect_idx.numel())
+    if explicit_protect_count > 0:
+        if explicit_protect_count > target_k:
+            target_k = min(n, explicit_protect_count)
+            target_ratio = float(target_k) / float(max(1, n))
+        protect_order = topk_indices(geo_score + 1e-4, explicit_protect_count, explicit_protect_mask & valid)
+        add_many(protect_order if int(protect_order.numel()) > 0 else protect_idx, "geo")
+
+    remaining_budget = max(0, int(target_k) - selected_count)
+    functional_weights = [
+        ("layout", float(quota_config.get("layout_quota_ratio", 0.30))),
+        ("contact", float(quota_config.get("contact_quota_ratio", 0.20))),
+        ("motion", float(quota_config.get("motion_quota_ratio", 0.15))),
+        ("sem", float(quota_config.get("semantic_quota_ratio", sem_ratio)) if sem_available else 0.0),
+        ("hist", float(quota_config.get("action_quota_ratio", hist_ratio)) if hist_available else 0.0),
+        ("fill", float(quota_config.get("fill_quota_ratio", 0.15))),
+    ]
+    functional_quotas = allocate_branch_quotas(remaining_budget, functional_weights)
+    functional_scores = {
+        "layout": layout_score,
+        "contact": contact_score,
+        "motion": motion_score,
+        "sem": sem_score,
+        "hist": hist_score,
+    }
+    for name in ("layout", "contact", "motion", "sem", "hist"):
+        quota = int(functional_quotas.get(name, 0))
+        if quota <= 0 or selected_count >= target_k:
+            continue
+        eligible = valid
+        if name in {"sem", "hist"} and requires_geo_alignment:
+            eligible = eligible & (geo_score > 0.0)
+        add_many(topk_indices(functional_scores[name], n, eligible), name, limit=quota)
+
+    if selected_count < target_k:
+        fill_score = torch.maximum(geo_score, torch.maximum(sem_score, hist_score))
+        fill_eligible = valid & fill_mask
+        fill_quota = max(int(functional_quotas.get("fill", 0)), int(target_k) - selected_count)
+        add_many(topk_indices(fill_score, n, fill_eligible), "fill", limit=fill_quota)
+
+    fallback_before = branch_unique_counts.get("fallback", 0)
+    if selected_count < target_k:
+        add_many(fallback, "fallback")
+    if selected_count < target_k:
+        any_score = torch.maximum(geo_score, torch.maximum(sem_score, hist_score)) + 1e-4
+        add_many(topk_indices(any_score, target_k, valid), "fallback")
+    if selected_count < target_k:
+        add_many(torch.nonzero(valid, as_tuple=False).reshape(-1), "fallback")
+    fallback_added = branch_unique_counts.get("fallback", 0) - fallback_before
+
+    keep = torch.nonzero(selected, as_tuple=False).reshape(-1).long()
+    final_mask = selected
+    geo_owner_count = (
+        branch_unique_counts.get("geo", 0)
+        + branch_unique_counts.get("layout", 0)
+        + branch_unique_counts.get("contact", 0)
+        + branch_unique_counts.get("motion", 0)
+    )
+    geo_protect_mask = explicit_protect_mask.clone()
+    if geo_owner_count > 0:
+        geo_protect_mask = geo_protect_mask | final_mask
+    final_kept_count = int(keep.numel())
+    branch_selected_sum = int(sum(branch_selected_counts.values()))
+    branch_unique_sum = int(sum(branch_unique_counts.values()))
+
+    return InternalQuotaSelectionResult(
+        keep=keep,
+        final_mask=final_mask,
+        geo_protect_mask=geo_protect_mask,
+        explicit_protect_mask=explicit_protect_mask,
+        target_k=int(target_k),
+        target_ratio=float(target_ratio),
+        hard_k=int(hard_k),
+        functional_enabled=True,
+        functional_quotas=functional_quotas,
+        branch_selected_counts=branch_selected_counts,
+        branch_unique_counts=branch_unique_counts,
+        branch_selected_sum=branch_selected_sum,
+        branch_unique_sum=branch_unique_sum,
+        branch_overlap_count=max(0, branch_selected_sum - final_kept_count),
+        branch_overlap_ratio=0.0,
+        branch_unique_ratio=1.0,
+        branch_sum_equals_kept=bool(branch_unique_sum == final_kept_count),
+        fallback_added=int(max(0, fallback_added)),
+        geo_budget_raised=bool(explicit_protect_count > 0 and explicit_protect_count >= target_k),
+    )
+
+
+def select_internal_quota_tokens(
+    *,
+    n: int,
+    device: torch.device,
+    valid: torch.Tensor,
+    fill_mask: torch.Tensor,
+    fallback: torch.Tensor,
+    target_k: int,
+    target_ratio: float,
+    hard_k: int,
+    sem_k: int,
+    hist_k: int,
+    sem_ratio: float,
+    hist_ratio: float,
+    requires_geo_alignment: bool,
+    quota_config: Dict[str, object],
+    explicit_protect_mask: torch.Tensor,
+    geo_score: torch.Tensor,
+    scene: torch.Tensor,
+    depth: torch.Tensor,
+    contact: torch.Tensor,
+    motion: torch.Tensor,
+    layout_score: torch.Tensor,
+    contact_score: torch.Tensor,
+    motion_score: torch.Tensor,
+    sem_score: torch.Tensor,
+    hist_score: torch.Tensor,
+    motion_valid: bool,
+    sem_available: bool,
+    hist_available: bool,
+) -> InternalQuotaSelectionResult:
+    functional_enabled = bool(quota_config.get("functional_quota_enabled", True))
+    if functional_enabled and bool(quota_config.get("latency_fast_path", False)):
+        return _select_internal_quota_tokens_fast(
+            n=n,
+            device=device,
+            valid=valid,
+            fill_mask=fill_mask,
+            fallback=fallback,
+            target_k=target_k,
+            target_ratio=target_ratio,
+            hard_k=hard_k,
+            sem_k=sem_k,
+            hist_k=hist_k,
+            sem_ratio=sem_ratio,
+            hist_ratio=hist_ratio,
+            requires_geo_alignment=requires_geo_alignment,
+            quota_config=quota_config,
+            explicit_protect_mask=explicit_protect_mask,
+            geo_score=geo_score,
+            layout_score=layout_score,
+            contact_score=contact_score,
+            motion_score=motion_score,
+            sem_score=sem_score,
+            hist_score=hist_score,
+            sem_available=sem_available,
+            hist_available=hist_available,
+        )
+
+    branch_names = ("geo", "layout", "contact", "motion", "sem", "hist", "fill", "fallback")
+    branch_to_id = {name: idx for idx, name in enumerate(branch_names)}
+    selected_mask = torch.zeros(n, dtype=torch.bool, device=device)
+    owner_ids = torch.full((n,), -1, dtype=torch.long, device=device)
+    branch_candidates: Dict[str, torch.Tensor] = {
+        name: torch.zeros(n, dtype=torch.bool, device=device) for name in branch_names
+    }
+    selected_count = 0
+
+    def add_many(indices: torch.Tensor, owner: str, limit: Optional[int] = None) -> None:
+        nonlocal selected_count
+        if indices is None or selected_count >= target_k:
+            return
+        idx = indices.long().reshape(-1)
+        if int(idx.numel()) <= 0:
+            return
+        idx = idx[(idx >= 0) & (idx < n)]
+        if int(idx.numel()) <= 0:
+            return
+        remaining = max(0, int(target_k) - selected_count)
+        take = remaining if limit is None else min(remaining, int(limit))
+        if take <= 0:
+            return
+
+        positions = torch.arange(int(idx.numel()), dtype=torch.long, device=device)
+        if int(idx.numel()) > 1:
+            prior_same = (idx.unsqueeze(1) == idx.unsqueeze(0)) & (positions.unsqueeze(1) < positions.unsqueeze(0))
+            first_occurrence = ~torch.any(prior_same, dim=0)
+        else:
+            first_occurrence = torch.ones_like(idx, dtype=torch.bool)
+        new_unique = (~selected_mask.index_select(0, idx)) & first_occurrence
+        new_positions = torch.nonzero(new_unique, as_tuple=False).reshape(-1)
+        if int(new_positions.numel()) > take:
+            prefix_mask = positions <= new_positions[take - 1]
+        else:
+            prefix_mask = torch.ones_like(new_unique, dtype=torch.bool)
+        candidate_idx = idx[prefix_mask]
+        if int(candidate_idx.numel()) > 0:
+            branch_candidates[owner][candidate_idx] = True
+        selected_idx = idx[new_unique & prefix_mask]
+        if int(selected_idx.numel()) <= 0:
+            return
+        selected_mask[selected_idx] = True
+        owner_ids[selected_idx] = int(branch_to_id[owner])
+        selected_count += int(selected_idx.numel())
+
+    explicit_protect_count = int(torch.sum(explicit_protect_mask).item())
+    if explicit_protect_count > 0:
+        if explicit_protect_count > target_k:
+            target_k = min(n, explicit_protect_count)
+            target_ratio = float(target_k) / float(max(1, n))
+        protect_idx = torch.nonzero(explicit_protect_mask, as_tuple=False).reshape(-1)
+        protect_order = topk_indices(geo_score + 1e-4, int(protect_idx.numel()), explicit_protect_mask)
+        add_many(protect_order if int(protect_order.numel()) > 0 else protect_idx, "geo")
+
+    functional_quotas: Dict[str, int] = {}
+    if functional_enabled:
+        remaining_budget = max(0, int(target_k) - selected_count)
+        functional_weights = [
+            ("layout", float(quota_config.get("layout_quota_ratio", 0.30)) if bool(torch.any(layout_score > 0.0).item()) else 0.0),
+            ("contact", float(quota_config.get("contact_quota_ratio", 0.20)) if bool(torch.any(contact_score > 0.0).item()) else 0.0),
+            ("motion", float(quota_config.get("motion_quota_ratio", 0.15)) if bool(torch.any(motion_score > 0.0).item()) else 0.0),
+            ("sem", float(quota_config.get("semantic_quota_ratio", sem_ratio)) if sem_available else 0.0),
+            ("hist", float(quota_config.get("action_quota_ratio", hist_ratio)) if hist_available else 0.0),
+            ("fill", float(quota_config.get("fill_quota_ratio", 0.15))),
+        ]
+        functional_quotas = allocate_branch_quotas(remaining_budget, functional_weights)
+        functional_scores = {
+            "layout": layout_score,
+            "contact": contact_score,
+            "motion": motion_score,
+            "sem": sem_score,
+            "hist": hist_score,
+        }
+        for name in ("layout", "contact", "motion", "sem", "hist"):
+            quota = int(functional_quotas.get(name, 0))
+            if quota <= 0 or selected_count >= target_k:
+                continue
+            eligible = valid
+            if name in {"sem", "hist"} and requires_geo_alignment:
+                eligible = eligible & (geo_score > 0.0)
+            add_many(topk_indices(functional_scores[name], n, eligible), name, limit=quota)
+    else:
+        branch_weights = [
+            ("scene", float(quota_config.get("w_scene", 0.30))),
+            ("depth", float(quota_config.get("w_depth", 0.25))),
+            ("contact", float(quota_config.get("w_contact", 0.25))),
+            ("motion", float(quota_config.get("w_motion", 0.20)) if motion_valid else 0.0),
+        ]
+        quotas = allocate_branch_quotas(hard_k, branch_weights)
+        branch_scores = {"scene": scene, "depth": depth, "contact": contact, "motion": motion}
+        for name in ("scene", "depth", "contact", "motion"):
+            quota = int(quotas.get(name, 0))
+            if quota > 0:
+                add_many(topk_indices(branch_scores[name], quota, valid), "geo", limit=quota)
+
+    geo_owner_ids = torch.as_tensor(
+        [branch_to_id[name] for name in ("geo", "layout", "contact", "motion")],
+        dtype=torch.long,
+        device=device,
+    )
+    quota_geo_mask = selected_mask & torch.isin(owner_ids, geo_owner_ids)
+    geo_protect_mask = quota_geo_mask | explicit_protect_mask
+
+    geo_budget_raised = bool(explicit_protect_count > 0 and explicit_protect_count >= target_k)
+    geo_count = int(torch.sum(geo_protect_mask).item())
+    if geo_count > target_k:
+        target_k = min(n, geo_count)
+        target_ratio = float(target_k) / float(max(1, n))
+        geo_budget_raised = True
+
+    if (not functional_enabled) and sem_k > 0 and selected_count < target_k:
+        sem_eligible = valid
+        if requires_geo_alignment:
+            sem_eligible = sem_eligible & (geo_score > 0.0)
+        add_many(topk_indices(sem_score, sem_k, sem_eligible), "sem", limit=sem_k)
+
+    if (not functional_enabled) and hist_k > 0 and selected_count < target_k:
+        hist_eligible = valid
+        if requires_geo_alignment:
+            hist_eligible = hist_eligible & (geo_score > 0.0)
+        add_many(topk_indices(hist_score, hist_k, hist_eligible), "hist", limit=hist_k)
+
+    if selected_count < target_k:
+        fill_score = torch.maximum(geo_score, torch.maximum(sem_score, hist_score))
+        fill_eligible = valid & fill_mask
+        fill_quota = int(functional_quotas.get("fill", target_k)) if functional_enabled else target_k
+        add_many(topk_indices(fill_score, n, fill_eligible), "fill", limit=max(fill_quota, target_k - selected_count))
+
+    fallback_count_before = int(torch.sum(selected_mask & (owner_ids == int(branch_to_id["fallback"]))).item())
+    if selected_count < target_k:
+        add_many(fallback, "fallback")
+    if selected_count < target_k:
+        any_order = topk_indices(torch.maximum(geo_score, torch.maximum(sem_score, hist_score)) + 1e-4, target_k, valid)
+        add_many(any_order, "fallback")
+    if selected_count < target_k:
+        add_many(torch.nonzero(valid, as_tuple=False).reshape(-1), "fallback")
+    fallback_added = int(torch.sum(selected_mask & (owner_ids == int(branch_to_id["fallback"]))).item()) - fallback_count_before
+
+    selected_idx = torch.nonzero(selected_mask, as_tuple=False).reshape(-1)
+    selected_owner = owner_ids.index_select(0, selected_idx) if int(selected_idx.numel()) > 0 else owner_ids[:0]
+    selected_explicit = (
+        explicit_protect_mask.index_select(0, selected_idx)
+        if int(selected_idx.numel()) > 0
+        else torch.empty(0, dtype=torch.bool, device=device)
+    )
+    selected_geo_owner = torch.isin(selected_owner, geo_owner_ids)
+    protect_keep = selected_idx[selected_explicit]
+    geo_keep = selected_idx[selected_geo_owner & ~selected_explicit]
+    other_keep = selected_idx[~selected_geo_owner & ~selected_explicit]
+    prioritized = torch.cat((protect_keep, geo_keep, other_keep), dim=0)
+    keep = prioritized[: max(int(target_k), int(protect_keep.numel()))].long()
+    final_mask = mask_from_indices(keep, n, device)
+
+    def branch_selected_count(name: str) -> int:
+        return int(torch.sum(branch_candidates[name] & final_mask).item())
+
+    def branch_unique_count(name: str) -> int:
+        return int(torch.sum((owner_ids == int(branch_to_id[name])) & final_mask).item())
+
+    branch_selected_counts = {name: branch_selected_count(name) for name in branch_names}
+    branch_unique_counts = {name: branch_unique_count(name) for name in branch_names}
+    branch_selected_sum = int(sum(branch_selected_counts.values()))
+    branch_unique_sum = int(sum(branch_unique_counts.values()))
+    final_kept_count = int(torch.sum(final_mask).item())
+    branch_overlap_count = max(0, branch_selected_sum - final_kept_count)
+    branch_overlap_ratio = (
+        float(branch_overlap_count) / float(max(1, branch_selected_sum))
+        if branch_selected_sum > 0
+        else 0.0
+    )
+    branch_unique_ratio = (
+        float(branch_unique_sum) / float(max(1, branch_selected_sum))
+        if branch_selected_sum > 0
+        else 1.0
+    )
+    branch_sum_equals_kept = bool(branch_unique_sum == final_kept_count)
+
+    return InternalQuotaSelectionResult(
+        keep=keep,
+        final_mask=final_mask,
+        geo_protect_mask=geo_protect_mask,
+        explicit_protect_mask=explicit_protect_mask,
+        target_k=int(target_k),
+        target_ratio=float(target_ratio),
+        hard_k=int(hard_k),
+        functional_enabled=bool(functional_enabled),
+        functional_quotas=functional_quotas,
+        branch_selected_counts=branch_selected_counts,
+        branch_unique_counts=branch_unique_counts,
+        branch_selected_sum=branch_selected_sum,
+        branch_unique_sum=branch_unique_sum,
+        branch_overlap_count=branch_overlap_count,
+        branch_overlap_ratio=float(branch_overlap_ratio),
+        branch_unique_ratio=float(branch_unique_ratio),
+        branch_sum_equals_kept=branch_sum_equals_kept,
+        fallback_added=int(fallback_added),
+        geo_budget_raised=bool(geo_budget_raised),
+    )

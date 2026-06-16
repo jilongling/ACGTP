@@ -1,0 +1,60 @@
+
+[Task 1/10] pick up the black bowl between the plate and the ramekin and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=1--success=False--task=pick_up_the_black_bowl_between_the_plate_and_the_r.mp4
+Success: False
+Total: 0/1 (0.0%)
+
+[Task 2/10] pick up the black bowl next to the ramekin and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=2--success=False--task=pick_up_the_black_bowl_next_to_the_ramekin_and_pla.mp4
+Success: False
+Total: 0/2 (0.0%)
+
+[Task 3/10] pick up the black bowl from table center and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=3--success=False--task=pick_up_the_black_bowl_from_table_center_and_place.mp4
+Success: False
+Total: 0/3 (0.0%)
+
+[Task 4/10] pick up the black bowl on the cookie box and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=4--success=False--task=pick_up_the_black_bowl_on_the_cookie_box_and_place.mp4
+Success: False
+Total: 0/4 (0.0%)
+
+[Task 5/10] pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=5--success=False--task=pick_up_the_black_bowl_in_the_top_drawer_of_the_wo.mp4
+Success: False
+Total: 0/5 (0.0%)
+
+[Task 6/10] pick up the black bowl on the ramekin and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=6--success=False--task=pick_up_the_black_bowl_on_the_ramekin_and_place_it.mp4
+Success: False
+Total: 0/6 (0.0%)
+
+[Task 7/10] pick up the black bowl next to the cookie box and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=7--success=False--task=pick_up_the_black_bowl_next_to_the_cookie_box_and_.mp4
+Success: False
+Total: 0/7 (0.0%)
+
+[Task 8/10] pick up the black bowl on the stove and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=8--success=False--task=pick_up_the_black_bowl_on_the_stove_and_place_it_o.mp4
+Success: False
+Total: 0/8 (0.0%)
+
+[Task 9/10] pick up the black bowl next to the plate and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=9--success=False--task=pick_up_the_black_bowl_next_to_the_plate_and_place.mp4
+Success: False
+Total: 0/9 (0.0%)
+
+[Task 10/10] pick up the black bowl on the wooden cabinet and place it on the plate
+Caught exception: 'model_forward_ms'
+Saved rollout MP4 at path ./rollouts/2026_05_15/2026_05_15-22_47_29--episode=10--success=False--task=pick_up_the_black_bowl_on_the_wooden_cabinet_and_p.mp4
+Success: False
+Total: 0/10 (0.0%)
